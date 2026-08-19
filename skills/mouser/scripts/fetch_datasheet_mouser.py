@@ -484,6 +484,115 @@ def _friendly_filename(mpn: str, description: str = "") -> str:
 # Main
 # ---------------------------------------------------------------------------
 
+
+# --- parametric attributes ---------------------------------------------------
+#
+# Distributor APIs return the electrical parameters a BOM needs to decide
+# whether two parts can be ordered as one line — voltage rating, tolerance,
+# dielectric, power. This resolver used to keep only manufacturer, description
+# and datasheet URL and discard the rest, which left the consumer parsing those
+# values back out of the description string. A number scraped from prose is a
+# guess; a number the distributor stated is not, and the difference decides
+# whether a 100nF X7R can be merged with a 100nF Y2 safety part.
+#
+# Shape-tolerant on purpose. Each API nests its parameters under a different key
+# with differently-named label/value fields, and those change without notice. So
+# rather than hardcode one layout, look for any of the known containers and pull
+# whichever label/value keys are present. An API that changes its wording yields
+# fewer attributes instead of raising, which is the right failure: a missing
+# attribute is already handled everywhere downstream as "cannot confirm".
+
+_PARAM_CONTAINERS = (
+    "ProductAttributes", "Parameters", "attributes", "paramVOList",
+    "Specifications", "specs", "productParamList",
+)
+_LABEL_KEYS = (
+    "AttributeName", "ParameterText", "attributeLabel", "paramNameEn",
+    "Parameter", "name", "label", "key",
+)
+_VALUE_KEYS = (
+    "AttributeValue", "ValueText", "attributeValue", "paramValueEn",
+    "Value", "value", "text",
+)
+
+
+def _attr_pairs(obj):
+    """(label, value) pairs from whichever container this API happens to use."""
+    pairs = []
+    if not isinstance(obj, dict):
+        return pairs
+    for container in _PARAM_CONTAINERS:
+        items = obj.get(container)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            label = next((str(item[k]) for k in _LABEL_KEYS if item.get(k)), "")
+            value = next((str(item[k]) for k in _VALUE_KEYS if item.get(k)), "")
+            if label and value:
+                pairs.append((label, value))
+    return pairs
+
+
+def _first_number(text):
+    m = re.search(r"[-+]?\d+(?:\.\d+)?", str(text).replace(",", ""))
+    return float(m.group(0)) if m else None
+
+
+def _parse_power(text):
+    """Watts from '1/4W', '0.25W', '250mW' — all three appear constantly."""
+    t = str(text)
+    frac = re.search(r"(\d+)\s*/\s*(\d+)\s*W", t, re.IGNORECASE)
+    if frac:
+        return float(frac.group(1)) / float(frac.group(2))
+    milli = re.search(r"(\d+(?:\.\d+)?)\s*mW", t, re.IGNORECASE)
+    if milli:
+        return float(milli.group(1)) / 1000.0
+    watt = re.search(r"(\d+(?:\.\d+)?)\s*W\b", t, re.IGNORECASE)
+    return float(watt.group(1)) if watt else None
+
+
+def _normalize_attributes(obj):
+    """Canonical electrical attributes, or {} when the API said nothing useful.
+
+    Only the fields a BOM actually groups on are emitted. Everything else a
+    distributor returns — packaging, lead time, RoHS — is real data and not this
+    function's business, and passing it through would invite it being trusted
+    for decisions it cannot support.
+    """
+    out = {}
+    for label, value in _attr_pairs(obj):
+        low = label.strip().lower()
+
+        if "tolerance" in low and "tolerance" not in out:
+            n = _first_number(value)
+            if n is not None:
+                out["tolerance"] = abs(n)
+        elif "voltage" in low and "voltage_v" not in out:
+            # "Voltage - Rated", "Voltage Rating (DC)", "Rated Voltage".
+            n = _first_number(value)
+            if n is not None:
+                out["voltage_v"] = n
+        elif ("power" in low or "wattage" in low) and "power_w" not in out:
+            w = _parse_power(value)
+            if w is not None:
+                out["power_w"] = w
+        elif ("dielectric" in low or "temperature coefficient" in low) and "dielectric" not in out:
+            m = re.search(r"\b(C0G|NP0|X5R|X7R|X7S|X8R|Y5V|Z5U)\b", str(value), re.IGNORECASE)
+            if m:
+                out["dielectric"] = m.group(1).upper()
+        elif ("safety" in low or "class" in low) and "safety_class" not in out:
+            # Only the mains-suppression classes. "Class 1" on a capacitor means
+            # something else entirely, so an unrecognised class is left out
+            # rather than guessed at.
+            m = re.search(r"\b([XY][12])\b", str(value))
+            if m:
+                out["safety_class"] = m.group(1).upper()
+        elif any(k in low for k in ("capacitance", "resistance", "inductance")) and "value" not in out:
+            out["value"] = str(value).strip()
+    return out
+
 def main():
     parser = argparse.ArgumentParser(
         description="Download a datasheet via Mouser search",
@@ -538,6 +647,9 @@ def main():
         result["manufacturer"] = mfg
         result["description"] = desc
         result["datasheet_url"] = ds_url
+        attrs = _normalize_attributes(mouser_part)
+        if attrs:
+            result["attributes"] = attrs
 
     output_path = args.output or (_friendly_filename(mpn, desc) + ".pdf")
 
