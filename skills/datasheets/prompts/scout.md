@@ -35,7 +35,25 @@ Produce a single JSON object matching this schema: `{{SCHEMA_PATH}}`.
 
 ## Constraints
 
-- The MPN you target must match exactly (case-insensitive) a callout in the PDF (cover, ordering info, or family member table). If `{{MPN}}` does not appear, set `quality_verdict.verdict: "skip"` with reason `"target MPN not found in PDF"`.
+- Satisfy yourself that this document really is about `{{MPN}}`, but do not
+  require the string to appear. A datasheet covers a product *line*, and the
+  orderable part number is frequently absent from it altogether:
+
+  - the document names the family (`nRF9151`) and the order code adds package
+    and reel suffixes (`NRF9151-LACA-R`) that appear only in an ordering table,
+    or nowhere;
+  - the part is a module sold under a distributor SKU (`100058045`) while the
+    document calls it by its product name (`Wio-LR2021`);
+  - one document covers several parts (`nRF54L15/L10/L05`).
+
+  Any of those is a match. Set `quality_verdict.verdict: "skip"` with reason
+  `"target MPN not found in PDF"` only when the document is about a *different*
+  part — a different family, a different vendor — not merely when the exact
+  string is missing.
+
+  Someone bound this file to this MPN deliberately, by writing a row in
+  `datasheets.md` or by naming the file. Refusing on a string match discards
+  that decision and, worse, reports it as success with nothing extracted.
 - For family PDFs, the family member list is the set of variant MPNs printed on the cover or in the ordering-information table. Do not invent variants.
 - Do not extract field values. No spec values, no pin names. The plan stage is structural.
 
