@@ -23,8 +23,11 @@
           "description": "Alternate function name as listed in the datasheet (e.g. 'USART1_TX', 'SPI2_MISO')."
         },
         "peripheral": {
-          "type": "string",
-          "description": "Peripheral family this alt function belongs to (e.g. 'USART1', 'SPI2', 'TIM3'). Detectors filter by this. Omitted where the function belongs to no peripheral: an analog input such as AIN7, a trace pin, or a debug signal is a real alternate function of the pin and has no peripheral family to name. Requiring it here failed 13 otherwise-correct rows of a 113-pin extraction that was right about every one of them."
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Peripheral family this alt function belongs to (e.g. 'USART1', 'SPI2', 'TIM3'). Detectors filter by this. Null where the function belongs to no peripheral: an analog input such as AIN7, a trace pin, a JTAG signal or a plain GPIO alternate is a real alternate function with no peripheral family to name. Optional AND nullable, because every other optional field in this schema is ['string','null'] — making this one bare 'string' taught models to emit null here and then rejected them for it. A 38-pin extraction that was correct about all 38 failed on exactly this."
         },
         "role": {
           "type": [
