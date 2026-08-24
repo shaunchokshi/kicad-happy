@@ -37,6 +37,20 @@ class BodyMm:
 
 
 @dataclass
+class PadMm:
+    """Exposed pad dimensions, from the package drawing."""
+    length: float = field(metadata={"description": "Exposed pad length in mm (nominal)."})
+    width: float = field(metadata={"description": "Exposed pad width in mm (nominal)."})
+
+
+@dataclass
+class LeadMm:
+    """Terminal dimensions, from the package drawing."""
+    width: float = field(metadata={"description": "Terminal width in mm (nominal)."})
+    length: float = field(metadata={"description": "Terminal length in mm (nominal)."})
+
+
+@dataclass
 class Package:
     """Physical package shape."""
     code: str = field(metadata={
@@ -49,6 +63,16 @@ class Package:
         "description": "Body dimensions. None when datasheet doesn't publish."})
     thermal_pad: Optional[bool] = field(default=None, metadata={
         "description": "True iff package has an exposed thermal pad."})
+    thermal_pad_mm: Optional["PadMm"] = field(default=None, metadata={
+        "description": (
+            "Exposed pad size in mm. Distinct from thermal_pad, which says only "
+            "whether there is one: on a QFN or DFN this is the single dimension "
+            "that tells a dozen otherwise identical land patterns apart, and no "
+            "bill of materials carries it.")})
+    lead_mm: Optional["LeadMm"] = field(default=None, metadata={
+        "description": (
+            "Terminal width and length in mm. Not needed to choose an existing "
+            "footprint; needed to generate one that does not exist.")})
     evidence: Optional[Evidence] = field(default=None, metadata={
         "description": "Provenance for the package entry."})
 

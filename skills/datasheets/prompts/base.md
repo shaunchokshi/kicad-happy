@@ -12,7 +12,27 @@ Produce a single JSON object matching this schema: `{{SCHEMA_PATH}}`.
 
 ## Field guide
 
-- `package`: object with `code` (e.g. "TO-263-5", "QFN-32"), `pin_count`, `pitch_mm`, `body_mm`, `thermal_pad` (bool). All require an `evidence` block (`{page, section, confidence, method}`).
+- `package`: object with `code` (e.g. "TO-263-5", "QFN-32"), `pin_count`, `pitch_mm`, `body_mm`, `thermal_pad` (bool), `thermal_pad_mm`, `lead_mm`. All require an `evidence` block (`{page, section, confidence, method}`).
+
+  **The package drawing is worth reading properly.** A package *name* does not
+  determine a land pattern and the numbers beside the drawing do. "SOIC-8" is
+  five different bodies; "QFN-24, 4x4mm, 0.5mm pitch" is a couple of dozen
+  footprints that differ only in the pad under the part. So:
+
+  - `pitch_mm` — the terminal pitch. Frequently left null when the drawing
+    states it plainly; it is one of the two numbers that narrows a package name
+    to a real footprint.
+  - `thermal_pad_mm` — `{length, width}` of the exposed pad, nominal. `thermal_pad: true`
+    says a pad exists, which narrows nothing. This is the dimension that picks
+    one land pattern out of a dozen, and no bill of materials carries it.
+  - `lead_mm` — `{width, length}` of a terminal, nominal. Only needed to *generate*
+    a footprint the libraries do not have, which is the common case for a
+    package the stock library happens to lack.
+
+  Take all of them from the mechanical drawing's dimension table, nominal column.
+  Omit any you genuinely cannot find rather than estimating from the picture —
+  and omit `thermal_pad_mm` or `lead_mm` **entirely** if you can only find one of
+  their two dimensions. Half a pad narrows nothing, and the schema rejects it.
 - `thermal`: object keyed by parameter name (`theta_ja`, `theta_jc`, `psi_jt`, `psi_jb`, ...). Each value is a list of `SpecValue` objects (`min`, `typ`, `max`, `unit`, `condition`, `notes`, `evidence`).
 - `absolute_max`: object keyed by parameter name (e.g. `VIN_max`, `TJ_max`, `Tstg`, `Vesd_HBM`). Each value is a list of SpecValue.
 - `recommended_operating`: object keyed by parameter name (e.g. `VIN`, `TA`, `IL`). Each value is a list of SpecValue.
