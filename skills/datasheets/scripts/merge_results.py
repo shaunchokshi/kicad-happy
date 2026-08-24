@@ -32,6 +32,10 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 SCHEMA_DIR = REPO_ROOT / "skills/datasheets/schemas"
 EXTRACTOR_SCHEMA_VERSION = "1.0"
 
+# The base block's own schema, moved when its shape changes. 1.1 added the
+# package drawing dimensions (thermal_pad_mm, lead_mm).
+BASE_SCHEMA_VERSION = "1.1"
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -124,7 +128,11 @@ def _splice_field(extraction: dict, task_id: str, role: str, data) -> None:
 
 def _initial_extraction(plan: dict) -> dict:
     return {
-        "schema_version": {"base": "1.0", "categories": {}},
+        # 1.1 adds package.thermal_pad_mm and package.lead_mm. The package object
+        # is additionalProperties: false, so a consumer validating a payload it
+        # was told is 1.0 would reject those keys — and one that wants them has
+        # nothing to gate on. Both problems are the version not moving.
+        "schema_version": {"base": BASE_SCHEMA_VERSION, "categories": {}},
         "source": {
             "manufacturer": "",
             "mpn": plan["mpn"],

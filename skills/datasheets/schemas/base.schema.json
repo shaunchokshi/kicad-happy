@@ -128,7 +128,7 @@
             "null"
           ],
           "additionalProperties": false,
-          "description": "Exposed pad size in millimetres, from the package drawing. Distinct from thermal_pad, which says only whether there is one: on a QFN or DFN this is the single dimension that tells a dozen otherwise identical land patterns apart, and no bill of materials carries it.",
+          "description": "Exposed pad size in millimetres, from the package drawing. Distinct from thermal_pad, which says only whether there is one: on a QFN or DFN this is the single dimension that tells a dozen otherwise identical land patterns apart, and no bill of materials carries it. Both dimensions or neither: half a pad narrows nothing, and the typed loader requires both, so a schema that accepted one would produce payloads that validate and will not load.",
           "properties": {
             "length": {
               "type": "number",
@@ -138,7 +138,11 @@
               "type": "number",
               "description": "Exposed pad width in mm (nominal)."
             }
-          }
+          },
+          "required": [
+            "length",
+            "width"
+          ]
         },
         "lead_mm": {
           "type": [
@@ -146,7 +150,7 @@
             "null"
           ],
           "additionalProperties": false,
-          "description": "Terminal dimensions in millimetres, from the package drawing. Not needed to choose an existing footprint; needed to generate one that does not exist, which is the case for any package the stock library happens to lack.",
+          "description": "Terminal dimensions in millimetres, from the package drawing. Not needed to choose an existing footprint; needed to generate one that does not exist, which is the case for any package the stock library happens to lack. Both dimensions or neither, for the same reason as the pad above.",
           "properties": {
             "width": {
               "type": "number",
@@ -156,7 +160,11 @@
               "type": "number",
               "description": "Terminal length in mm (nominal)."
             }
-          }
+          },
+          "required": [
+            "width",
+            "length"
+          ]
         }
       }
     },

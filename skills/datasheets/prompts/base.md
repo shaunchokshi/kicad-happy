@@ -30,7 +30,9 @@ Produce a single JSON object matching this schema: `{{SCHEMA_PATH}}`.
     package the stock library happens to lack.
 
   Take all of them from the mechanical drawing's dimension table, nominal column.
-  Omit any you genuinely cannot find rather than estimating from the picture.
+  Omit any you genuinely cannot find rather than estimating from the picture —
+  and omit `thermal_pad_mm` or `lead_mm` **entirely** if you can only find one of
+  their two dimensions. Half a pad narrows nothing, and the schema rejects it.
 - `thermal`: object keyed by parameter name (`theta_ja`, `theta_jc`, `psi_jt`, `psi_jb`, ...). Each value is a list of `SpecValue` objects (`min`, `typ`, `max`, `unit`, `condition`, `notes`, `evidence`).
 - `absolute_max`: object keyed by parameter name (e.g. `VIN_max`, `TJ_max`, `Tstg`, `Vesd_HBM`). Each value is a list of SpecValue.
 - `recommended_operating`: object keyed by parameter name (e.g. `VIN`, `TA`, `IL`). Each value is a list of SpecValue.
