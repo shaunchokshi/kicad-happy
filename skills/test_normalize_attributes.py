@@ -119,6 +119,50 @@ def test_packaging_and_compliance_are_not_emitted():
     assert got == {}
 
 
+# -- the package, for choosing a land pattern ---------------------------------
+
+def test_the_package_a_distributor_states_is_read():
+    """A package name does not determine a land pattern, and the pipeline has to
+    produce one. What a distributor states about the package narrows the search
+    where a bill of materials, which carries only the name, cannot."""
+    got = norm({"Parameters": [
+        {"Parameter": "Package / Case", "Value": "24-WFQFN Exposed Pad"},
+        {"Parameter": "Supplier Device Package", "Value": "24-WQFN (4x4)"},
+        {"Parameter": "Size / Dimension", "Value": '0.157" L x 0.157" W (4.00mm x 4.00mm)'},
+        {"Parameter": "Height - Seated (Max)", "Value": '0.031" (0.80mm)'},
+    ]})
+    assert got["package"] == "24-WFQFN Exposed Pad"
+    assert got["supplier_package"] == "24-WQFN (4x4)"
+    assert got["body_mm"] == {"length": 4.0, "width": 4.0}
+    assert got["height_mm"] == 0.8
+
+
+def test_the_metric_half_is_the_one_read():
+    """Distributors state both systems. Reading the imperial figure would put a
+    body of 0.157mm on a 4mm part."""
+    got = norm({"Parameters": [
+        {"Parameter": "Size / Dimension", "Value": '0.276" L x 0.209" W (7.00mm x 5.30mm)'},
+    ]})
+    assert got["body_mm"] == {"length": 7.0, "width": 5.3}
+
+
+def test_a_lone_measurement_in_a_size_field_is_not_guessed_at():
+    """It could be either dimension, and a wrong body size in a field that looks
+    authoritative is worse than an absent one."""
+    assert "body_mm" not in norm({"Parameters": [
+        {"Parameter": "Size / Dimension", "Value": "4.00mm"},
+    ]})
+
+
+def test_packaging_is_still_not_a_package():
+    """`Packaging` is the reel. The label is matched exactly for this reason —
+    a substring test would have read 'Tape & Reel (TR)' as the part's package."""
+    got = norm({"ProductAttributes": [
+        {"AttributeName": "Packaging", "AttributeValue": "Tape & Reel (TR)"},
+    ]})
+    assert got == {}
+
+
 # -- number forms in the wild ------------------------------------------------
 
 def test_power_is_read_in_fraction_decimal_and_milliwatt_forms():

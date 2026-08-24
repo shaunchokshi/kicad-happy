@@ -470,19 +470,72 @@ def _parse_power(text):
     return float(watt.group(1)) if watt else None
 
 
-def _normalize_attributes(obj):
-    """Canonical electrical attributes, or {} when the API said nothing useful.
+def _mm_pair(text):
+    """(4.0, 4.0) from '0.157" L x 0.157" W (4.00mm x 4.00mm)'.
 
-    Only the fields a BOM actually groups on are emitted. Everything else a
-    distributor returns — packaging, lead time, RoHS — is real data and not this
-    function's business, and passing it through would invite it being trusted
-    for decisions it cannot support.
+    Distributors state both systems and the metric one is in the parentheses.
+    Only the paired form is read: a lone measurement in a size field could be
+    either dimension, and guessing which would put a wrong body size somewhere
+    that looks authoritative.
+    """
+    m = re.search(r"([\d.]+)\s*mm\s*[x\u00d7]\s*([\d.]+)\s*mm", str(text), re.IGNORECASE)
+    if not m:
+        return None
+    try:
+        return float(m.group(1)), float(m.group(2))
+    except ValueError:
+        return None
+
+
+def _mm_scalar(text):
+    """4.0 from '0.157" (4.00mm)'."""
+    m = re.search(r"([\d.]+)\s*mm", str(text), re.IGNORECASE)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return None
+
+
+def _normalize_attributes(obj):
+    """Canonical electrical and package attributes, or {} when the API said
+    nothing useful.
+
+    The fields a BOM groups on, plus what the distributor states about the
+    package. Everything else — lead time, RoHS, reel size — is real data and not
+    this function's business, and passing it through would invite it being
+    trusted for decisions it cannot support.
+
+    The package fields are here because the pipeline has to turn a package into
+    a *land pattern*, and a package name does not determine one: "SOIC-8" is
+    five different bodies. A distributor states the body size and height that a
+    bill of materials never carries, and that narrows the search.
+
+    They are named so they cannot be mistaken for a footprint. "24-WQFN (4x4)"
+    is a hint; it is not a land pattern, and it does not carry the exposed pad,
+    which is the dimension that actually settles a no-lead package and comes
+    only from the datasheet's package drawing.
     """
     out = {}
     for label, value in _attr_pairs(obj):
         low = label.strip().lower()
 
-        if "tolerance" in low and "tolerance" not in out:
+        if low in ("package / case", "package/case", "package", "case") and "package" not in out:
+            out["package"] = str(value).strip()
+        elif "supplier device package" in low and "supplier_package" not in out:
+            # DigiKey's own rendering, and usually the more specific of the two:
+            # "24-WQFN (4x4)" where Package / Case says "24-WFQFN Exposed Pad".
+            out["supplier_package"] = str(value).strip()
+        elif ("size" in low or "dimension" in low) and "body_mm" not in out:
+            pair = _mm_pair(value)
+            if pair:
+                out["body_mm"] = {"length": pair[0], "width": pair[1]}
+        elif "height" in low and "height_mm" not in out:
+            mm = _mm_scalar(value)
+            if mm is not None:
+                out["height_mm"] = mm
+        elif "tolerance" in low and "tolerance" not in out:
             n = _first_number(value)
             if n is not None:
                 out["tolerance"] = abs(n)
