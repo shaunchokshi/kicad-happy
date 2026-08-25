@@ -479,6 +479,18 @@ _VALUE_KEYS = (
     "AttributeValue", "ValueText", "attributeValue", "paramValueEn",
     "Value", "value", "text",
 )
+# Element14 states a measurement as a bare number and its unit as a sibling
+# field: attributeValue "0.8", attributeUnit "mm". Both _mm_pair and _mm_scalar
+# match on the literal unit, so a value handed over without it is discarded —
+# the safe failure, and still a total loss of the only body and height figures
+# that supplier returns.
+_UNIT_KEYS = ("attributeUnit", "unit", "Unit")
+# Some APIs state the package as a plain field on the component rather than as
+# one row in a parameter list. LCSC's jlcsearch is the one in hand: the package
+# is component["package"] and component["extra"]["package"], neither of them a
+# list, so the container walk below never reaches either and `--json` came back
+# with no package at all on a request that otherwise looked successful.
+_SCALAR_PACKAGE_KEYS = ("package", "packageType", "encapsulation")
 
 
 def _attr_pairs(obj):
@@ -495,8 +507,19 @@ def _attr_pairs(obj):
                 continue
             label = next((str(item[k]) for k in _LABEL_KEYS if item.get(k)), "")
             value = next((str(item[k]) for k in _VALUE_KEYS if item.get(k)), "")
+            unit = next((str(item[k]) for k in _UNIT_KEYS if item.get(k)), "")
             if label and value:
-                pairs.append((label, value))
+                pairs.append((label, f"{value} {unit}".strip() if unit else value))
+    # Last, not first, so a properly labelled row still wins: DigiKey's
+    # "Package / Case" is more specific than a bare scalar, and
+    # _normalize_attributes keeps whichever it sees first.
+    for source in (obj, obj.get("extra")):
+        if not isinstance(source, dict):
+            continue
+        for key in _SCALAR_PACKAGE_KEYS:
+            value = source.get(key)
+            if isinstance(value, (str, int, float)) and str(value).strip():
+                pairs.append(("Package", str(value).strip()))
     return pairs
 
 
@@ -518,19 +541,81 @@ def _parse_power(text):
     return float(watt.group(1)) if watt else None
 
 
-def _normalize_attributes(obj):
-    """Canonical electrical attributes, or {} when the API said nothing useful.
+def _mm_pair(text):
+    """(4.0, 4.0) from '0.157" L x 0.157" W (4.00mm x 4.00mm)'.
 
-    Only the fields a BOM actually groups on are emitted. Everything else a
-    distributor returns — packaging, lead time, RoHS — is real data and not this
-    function's business, and passing it through would invite it being trusted
-    for decisions it cannot support.
+    Distributors state both systems and the metric one is in the parentheses.
+    Only the paired form is read: a lone measurement in a size field could be
+    either dimension, and guessing which would put a wrong body size somewhere
+    that looks authoritative.
+    """
+    m = re.search(r"([\d.]+)\s*mm\s*[x\u00d7]\s*([\d.]+)\s*mm", str(text), re.IGNORECASE)
+    if not m:
+        # One unit for the pair: "4 x 4 mm". Element14 states the value and the
+        # unit in separate fields, so a size arrives rejoined that way rather
+        # than with mm after each number. Still unambiguous — the caution above
+        # is about a *lone* measurement, where there is no telling which
+        # dimension it is; a pair sharing a trailing unit has neither problem.
+        # Tried second so an inch-first string like
+        # '0.157" L x 0.157" W (4.00mm x 4.00mm)' still yields the metric pair.
+        m = re.search(r"([\d.]+)\s*[x\u00d7]\s*([\d.]+)\s*mm", str(text), re.IGNORECASE)
+    if not m:
+        return None
+    try:
+        return float(m.group(1)), float(m.group(2))
+    except ValueError:
+        return None
+
+
+def _mm_scalar(text):
+    """4.0 from '0.157" (4.00mm)'."""
+    m = re.search(r"([\d.]+)\s*mm", str(text), re.IGNORECASE)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return None
+
+
+def _normalize_attributes(obj):
+    """Canonical electrical and package attributes, or {} when the API said
+    nothing useful.
+
+    The fields a BOM groups on, plus what the distributor states about the
+    package. Everything else — lead time, RoHS, reel size — is real data and not
+    this function's business, and passing it through would invite it being
+    trusted for decisions it cannot support.
+
+    The package fields are here because the pipeline has to turn a package into
+    a *land pattern*, and a package name does not determine one: "SOIC-8" is
+    five different bodies. A distributor states the body size and height that a
+    bill of materials never carries, and that narrows the search.
+
+    They are named so they cannot be mistaken for a footprint. "24-WQFN (4x4)"
+    is a hint; it is not a land pattern, and it does not carry the exposed pad,
+    which is the dimension that actually settles a no-lead package and comes
+    only from the datasheet's package drawing.
     """
     out = {}
     for label, value in _attr_pairs(obj):
         low = label.strip().lower()
 
-        if "tolerance" in low and "tolerance" not in out:
+        if low in ("package / case", "package/case", "package", "case") and "package" not in out:
+            out["package"] = str(value).strip()
+        elif "supplier device package" in low and "supplier_package" not in out:
+            # DigiKey's own rendering, and usually the more specific of the two:
+            # "24-WQFN (4x4)" where Package / Case says "24-WFQFN Exposed Pad".
+            out["supplier_package"] = str(value).strip()
+        elif ("size" in low or "dimension" in low) and "body_mm" not in out:
+            pair = _mm_pair(value)
+            if pair:
+                out["body_mm"] = {"length": pair[0], "width": pair[1]}
+        elif "height" in low and "height_mm" not in out:
+            mm = _mm_scalar(value)
+            if mm is not None:
+                out["height_mm"] = mm
+        elif "tolerance" in low and "tolerance" not in out:
             n = _first_number(value)
             if n is not None:
                 out["tolerance"] = abs(n)

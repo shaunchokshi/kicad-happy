@@ -119,6 +119,50 @@ def test_packaging_and_compliance_are_not_emitted():
     assert got == {}
 
 
+# -- the package, for choosing a land pattern ---------------------------------
+
+def test_the_package_a_distributor_states_is_read():
+    """A package name does not determine a land pattern, and the pipeline has to
+    produce one. What a distributor states about the package narrows the search
+    where a bill of materials, which carries only the name, cannot."""
+    got = norm({"Parameters": [
+        {"Parameter": "Package / Case", "Value": "24-WFQFN Exposed Pad"},
+        {"Parameter": "Supplier Device Package", "Value": "24-WQFN (4x4)"},
+        {"Parameter": "Size / Dimension", "Value": '0.157" L x 0.157" W (4.00mm x 4.00mm)'},
+        {"Parameter": "Height - Seated (Max)", "Value": '0.031" (0.80mm)'},
+    ]})
+    assert got["package"] == "24-WFQFN Exposed Pad"
+    assert got["supplier_package"] == "24-WQFN (4x4)"
+    assert got["body_mm"] == {"length": 4.0, "width": 4.0}
+    assert got["height_mm"] == 0.8
+
+
+def test_the_metric_half_is_the_one_read():
+    """Distributors state both systems. Reading the imperial figure would put a
+    body of 0.157mm on a 4mm part."""
+    got = norm({"Parameters": [
+        {"Parameter": "Size / Dimension", "Value": '0.276" L x 0.209" W (7.00mm x 5.30mm)'},
+    ]})
+    assert got["body_mm"] == {"length": 7.0, "width": 5.3}
+
+
+def test_a_lone_measurement_in_a_size_field_is_not_guessed_at():
+    """It could be either dimension, and a wrong body size in a field that looks
+    authoritative is worse than an absent one."""
+    assert "body_mm" not in norm({"Parameters": [
+        {"Parameter": "Size / Dimension", "Value": "4.00mm"},
+    ]})
+
+
+def test_packaging_is_still_not_a_package():
+    """`Packaging` is the reel. The label is matched exactly for this reason —
+    a substring test would have read 'Tape & Reel (TR)' as the part's package."""
+    got = norm({"ProductAttributes": [
+        {"AttributeName": "Packaging", "AttributeValue": "Tape & Reel (TR)"},
+    ]})
+    assert got == {}
+
+
 # -- number forms in the wild ------------------------------------------------
 
 def test_power_is_read_in_fraction_decimal_and_milliwatt_forms():
@@ -165,3 +209,83 @@ if __name__ == "__main__":
                 print(f"  FAIL {name}: {exc}")
     print(f"\n{failed} failed" if failed else "\nall passed")
     sys.exit(1 if failed else 0)
+
+
+# -- package data that is not a row in a parameter list -----------------------
+
+def test_lcsc_states_the_package_as_a_plain_field():
+    """jlcsearch puts it on the component, not in a parameter container.
+
+    The attribute walk only traverses list-valued containers, so for LCSC's
+    documented response shape the package branch was never reached at all and
+    `--json` came back without one — on a request that otherwise looked like it
+    had succeeded, which is the worst way to lose a field.
+    """
+    got = norm({"package": "QFN-24", "mfr": "TPS62840"})
+    assert got["package"] == "QFN-24"
+
+
+def test_lcsc_extra_carries_it_too():
+    got = norm({"extra": {"package": "WSON-8"}})
+    assert got["package"] == "WSON-8"
+
+
+def test_a_labelled_row_still_beats_a_bare_scalar():
+    """DigiKey states both; "Package / Case" is the more specific of the two."""
+    got = norm({
+        "package": "QFN",
+        "Parameters": [{"Parameter": "Package / Case", "Value": "24-WFQFN Exposed Pad"}],
+    })
+    assert got["package"] == "24-WFQFN Exposed Pad"
+
+
+def test_a_package_field_that_is_empty_is_not_a_package():
+    assert norm({"package": "  ", "extra": {"package": None}}) == {}
+
+
+def test_extra_that_is_still_a_json_string_is_not_mistaken_for_a_mapping():
+    # LCSC hands `extra` over as a string until _parse_extra has run on it.
+    assert norm({"extra": '{"package": "QFN-24"}'}) == {}
+
+
+# -- Element14 keeps its unit in a separate field -----------------------------
+
+def test_element14_body_size_survives_its_separate_unit():
+    """attributeValue "4 x 4", attributeUnit "mm" — the shape it documents.
+
+    Both dimension parsers match on the literal unit, so a value passed on
+    without it is declined rather than misread. Safe, and still a total loss of
+    the only body figures this supplier returns.
+    """
+    got = norm({"attributes": [
+        {"attributeLabel": "Size / Dimension", "attributeValue": "4 x 4", "attributeUnit": "mm"},
+    ]})
+    assert got["body_mm"] == {"length": 4.0, "width": 4.0}
+
+
+def test_element14_height_survives_its_separate_unit():
+    got = norm({"attributes": [
+        {"attributeLabel": "Height - Seated (Max)", "attributeValue": "0.8", "attributeUnit": "mm"},
+    ]})
+    assert got["height_mm"] == 0.8
+
+
+def test_a_value_that_already_carries_its_unit_is_not_given_a_second_one():
+    got = norm({"attributes": [
+        {"attributeLabel": "Height", "attributeValue": "0.8mm"},
+    ]})
+    assert got["height_mm"] == 0.8
+
+
+def test_an_inch_first_string_still_yields_the_metric_pair():
+    """The shared-unit fallback must not steal a match from the metric pair."""
+    got = norm({"Parameters": [
+        {"Parameter": "Size / Dimension", "Value": '0.157" L x 0.157" W (4.00mm x 4.00mm)'},
+    ]})
+    assert got["body_mm"] == {"length": 4.0, "width": 4.0}
+
+
+def test_a_pair_with_no_unit_at_all_is_declined():
+    assert "body_mm" not in norm({"attributes": [
+        {"attributeLabel": "Size / Dimension", "attributeValue": "4 x 4"},
+    ]})
