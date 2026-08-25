@@ -479,6 +479,18 @@ _VALUE_KEYS = (
     "AttributeValue", "ValueText", "attributeValue", "paramValueEn",
     "Value", "value", "text",
 )
+# Element14 states a measurement as a bare number and its unit as a sibling
+# field: attributeValue "0.8", attributeUnit "mm". Both _mm_pair and _mm_scalar
+# match on the literal unit, so a value handed over without it is discarded —
+# the safe failure, and still a total loss of the only body and height figures
+# that supplier returns.
+_UNIT_KEYS = ("attributeUnit", "unit", "Unit")
+# Some APIs state the package as a plain field on the component rather than as
+# one row in a parameter list. LCSC's jlcsearch is the one in hand: the package
+# is component["package"] and component["extra"]["package"], neither of them a
+# list, so the container walk below never reaches either and `--json` came back
+# with no package at all on a request that otherwise looked successful.
+_SCALAR_PACKAGE_KEYS = ("package", "packageType", "encapsulation")
 
 
 def _attr_pairs(obj):
@@ -495,8 +507,19 @@ def _attr_pairs(obj):
                 continue
             label = next((str(item[k]) for k in _LABEL_KEYS if item.get(k)), "")
             value = next((str(item[k]) for k in _VALUE_KEYS if item.get(k)), "")
+            unit = next((str(item[k]) for k in _UNIT_KEYS if item.get(k)), "")
             if label and value:
-                pairs.append((label, value))
+                pairs.append((label, f"{value} {unit}".strip() if unit else value))
+    # Last, not first, so a properly labelled row still wins: DigiKey's
+    # "Package / Case" is more specific than a bare scalar, and
+    # _normalize_attributes keeps whichever it sees first.
+    for source in (obj, obj.get("extra")):
+        if not isinstance(source, dict):
+            continue
+        for key in _SCALAR_PACKAGE_KEYS:
+            value = source.get(key)
+            if isinstance(value, (str, int, float)) and str(value).strip():
+                pairs.append(("Package", str(value).strip()))
     return pairs
 
 
@@ -527,6 +550,15 @@ def _mm_pair(text):
     that looks authoritative.
     """
     m = re.search(r"([\d.]+)\s*mm\s*[x\u00d7]\s*([\d.]+)\s*mm", str(text), re.IGNORECASE)
+    if not m:
+        # One unit for the pair: "4 x 4 mm". Element14 states the value and the
+        # unit in separate fields, so a size arrives rejoined that way rather
+        # than with mm after each number. Still unambiguous — the caution above
+        # is about a *lone* measurement, where there is no telling which
+        # dimension it is; a pair sharing a trailing unit has neither problem.
+        # Tried second so an inch-first string like
+        # '0.157" L x 0.157" W (4.00mm x 4.00mm)' still yields the metric pair.
+        m = re.search(r"([\d.]+)\s*[x\u00d7]\s*([\d.]+)\s*mm", str(text), re.IGNORECASE)
     if not m:
         return None
     try:
