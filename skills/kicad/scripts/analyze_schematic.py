@@ -1356,9 +1356,20 @@ def build_net_map(components: list[dict], wires: list[dict], labels: list[dict],
         point_info.setdefault(k, []).append(info)
         return k
 
-    # Add component pins (skip PWR_FLAG — it's an ERC marker, not a real connection)
+    # Add component pins. PWR_FLAG included: it has exactly one pin, so it can
+    # only ever land on the net already at that point and never joins two
+    # nets — the "ERC marker, not a real connection" worry was about
+    # joining, and a single point cannot join anything. It has to be in the
+    # map because audit_rail_sources and audit_pwr_flags decide a rail is
+    # sourced by finding a #FLG pin *in this map*; skipping it here meant
+    # every correctly flagged rail was reported as having no declared
+    # source while KiCad's own ERC passed it. Consumers that want physical
+    # pins only already filter #FLG/#PWR (netlist_queries, get_net_neighbors,
+    # the multi-driver check). Regular power symbols (#PWR) were always added
+    # here and their names arrive through `power_symbols`; PWR_FLAG's own
+    # name is dropped there because "PWR_FLAG" is not a rail.
     for comp in components:
-        if comp.get("value") == "PWR_FLAG" or comp.get("type") == "power_flag":
+        if comp.get("type") == "power_flag":
             continue
         sheet = comp.get("_sheet", 0)
         for pin in comp.get("pins", []):
