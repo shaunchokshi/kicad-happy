@@ -708,18 +708,32 @@ def check_connector_filtering(pcb: Dict, schematic: Optional[Dict] = None) -> Li
                 has_nearby_filter = True
                 break
 
-        # Also check schematic-detected protection
+        # Also check schematic-detected protection.
+        #
+        # Read `pad_nets`, not `pads` — the same trap the power-only gate below
+        # documents. The PCB analyzer strips per-pad geometry from its output,
+        # so `conn.get('pads')` is absent and this whole branch silently
+        # no-opped: conn_nets came out empty, no protected net could ever match,
+        # and a board with a correctly wired ESD array on its USB data lines was
+        # told it had no EMC filtering. That matters most before layout, when
+        # the 25 mm proximity test above cannot pass on principle because
+        # nothing has been placed yet — the schematic path is the only one open,
+        # and it was shut.
         if not has_nearby_filter:
-            conn_nets = set()
-            for pad in conn.get('pads', []):
-                n = pad.get('net_name', '')
-                if n and not _is_power_or_ground(n):
-                    conn_nets.add(n)
+            conn_nets = {
+                v.get('net', '')
+                for v in conn.get('pad_nets', {}).values()
+                if isinstance(v, dict) and v.get('net')
+                and not _is_power_or_ground(v['net'])
+            }
 
             if schematic:
                 for pd in get_findings(schematic, Det.PROTECTION_DEVICES):
+                    prot_nets = set(pd.get('protected_nets') or [])
                     prot_net = pd.get('protected_net', '')
-                    if prot_net in conn_nets:
+                    if prot_net:
+                        prot_nets.add(prot_net)
+                    if prot_nets & conn_nets:
                         has_nearby_filter = True
                         break
 
