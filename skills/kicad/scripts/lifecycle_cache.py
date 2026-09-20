@@ -63,7 +63,8 @@ _BASE_BY_COUNT: dict[int, float] = {0: 0.0, 1: 0.55, 2: 0.82, 3: 0.93, 4: 1.0}
 _SPREAD_WEIGHT = 0.5
 
 
-def score(per_source_status: dict[str, str]) -> dict[str, Any]:
+def score(per_source_status: dict[str, str],
+          capable: int | None = None) -> dict[str, Any]:
     """Confidence in a part's lifecycle status, and why.
 
     Returns the agreed status where there is one, a confidence in [0, 1], and
@@ -79,6 +80,7 @@ def score(per_source_status: dict[str, str]) -> dict[str, Any]:
             "confidence": 0.0,
             "status": "unknown",
             "responding": 0,
+            "capable": capable,
             "agreement": None,
             "spread": None,
             "reason": "no source returned a usable status",
@@ -94,14 +96,22 @@ def score(per_source_status: dict[str, str]) -> dict[str, Any]:
     # distributor calls obsolete is a procurement problem even while another
     # still lists it.
     worst = max(known.values(), key=lambda st: STATUS_AXIS[st])
+    # How many sources *could* have answered, when the caller knows. Two of
+    # the four distributors here return stock and price but no lifecycle
+    # field at all, so "one of four responded" reads as a failure when the
+    # truth is "one of the two that can answer did".
+    denom = ""
+    if capable:
+        denom = " of %d able to" % capable
     return {
         "confidence": round(confidence, 3),
         "status": worst,
         "responding": n,
+        "capable": capable,
         "agreement": round(1.0 - spread, 3),
         "spread": round(spread, 3),
         "reason": (
-            "%d source%s agreed" % (n, "" if n == 1 else "s") if spread == 0
+            "%d source%s%s agreed" % (n, "" if n == 1 else "s", denom) if spread == 0
             else "%d sources, worst disagreement %d step%s on the lifecycle axis"
                  % (n, hi - lo, "" if hi - lo == 1 else "s")
         ),
@@ -316,3 +326,89 @@ class SourceScheduler:
                 self.cache.timing(s).get("ewma_s") for s in self.sources
             ) else "ladder defaults, no timings recorded yet",
         }
+
+
+class RateLimiter:
+    """A minimum interval between calls to the same distributor.
+
+    The serial audit had ``time.sleep(1.0)`` before every call. That sleep was
+    the audit's dominant cost and removing it is most of the speed-up — but it
+    was also, accidentally, the only rate limiting there was. Firing eight
+    parts at four sources concurrently put element14 straight into
+    "Account Over Queries Per Second Limit", which is a 403 that looks exactly
+    like a credential failure in a log and is not one.
+
+    So the interval comes back, per source rather than globally, and it is
+    learned: a source that never rejects us is never slowed down, and one that
+    does gets backed off until it stops.
+    """
+
+    # Seeded from observed behaviour. element14 rejects at roughly three
+    # requests per second; the others have not complained.
+    DEFAULT_INTERVALS: dict[str, float] = {"element14": 1.1}
+
+    MAX_INTERVAL = 8.0
+
+    def __init__(self, cache: "LifecycleCache | None" = None) -> None:
+        import threading
+        self._lock = threading.Lock()
+        self._next_allowed: dict[str, float] = {}
+        self._interval: dict[str, float] = dict(self.DEFAULT_INTERVALS)
+        self._cache = cache
+        if cache is not None:
+            for src, row in (cache._timing or {}).items():
+                learned = row.get("min_interval_s")
+                if learned:
+                    self._interval[src] = float(learned)
+
+    def interval(self, source: str) -> float:
+        return self._interval.get(source, 0.0)
+
+    def acquire(self, source: str) -> None:
+        """Block until this source may be called again."""
+        gap = self._interval.get(source, 0.0)
+        if gap <= 0:
+            return
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                ready = self._next_allowed.get(source, 0.0)
+                if now >= ready:
+                    self._next_allowed[source] = now + gap
+                    return
+                wait = ready - now
+            time.sleep(min(wait, gap))
+
+    def penalise(self, source: str) -> float:
+        """A source said no. Back off, and remember it for the next run."""
+        with self._lock:
+            cur = self._interval.get(source, 0.0)
+            new = min(self.MAX_INTERVAL, cur * 2 if cur > 0 else 1.0)
+            self._interval[source] = new
+        if self._cache is not None:
+            row = self._cache._timing.setdefault(
+                source, {"ewma_s": None, "ok": 0, "timeouts": 0})
+            row["min_interval_s"] = new
+            row["rejections"] = row.get("rejections", 0) + 1
+        return new
+
+    @staticmethod
+    def is_rejection(exc: BaseException) -> bool:
+        """Whether a failure was the source refusing us rather than breaking.
+
+        A 429 is unambiguous. A 403 is not — it is also what an invalid key
+        returns — so the body is checked for the words distributors actually
+        use, and anything else is left alone rather than being silently
+        treated as a rate limit that more waiting would cure.
+        """
+        code = getattr(exc, "code", None)
+        if code == 429:
+            return True
+        if code != 403:
+            return False
+        try:
+            body = exc.read().decode("utf-8", "replace").lower()  # type: ignore[attr-defined]
+        except Exception:
+            return False
+        return any(t in body for t in
+                   ("per second", "rate limit", "too many", "quota", "throttl"))

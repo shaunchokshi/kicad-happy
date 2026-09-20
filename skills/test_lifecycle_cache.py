@@ -24,6 +24,7 @@ from lifecycle_cache import (  # noqa: E402
     DEFAULT_TTL_DAYS,
     LADDER,
     LifecycleCache,
+    RateLimiter,
     SourceScheduler,
     score,
 )
@@ -77,6 +78,85 @@ def test_unknown_is_absence_not_disagreement():
     both = score({"a": "active", "b": "active"})
     with_silent = score({"a": "active", "b": "active", "c": "unknown"})
     assert both["confidence"] == with_silent["confidence"]
+
+
+def test_capable_denominator_is_reported():
+    """Two of four distributors return stock but no lifecycle field, so
+    "one of four responded" reads as failure when the truth is "one of the two
+    that can answer did"."""
+    r = score({"digikey": "active"}, capable=2)
+    assert r["capable"] == 2
+    assert "of 2 able to" in r["reason"]
+
+
+def test_capable_does_not_change_the_number():
+    """Explaining the denominator must not inflate the confidence."""
+    assert (score({"digikey": "active"}, capable=2)["confidence"]
+            == score({"digikey": "active"})["confidence"])
+
+
+# -- rate limiting --------------------------------------------------------
+
+def test_sources_that_never_reject_are_never_slowed():
+    r = RateLimiter()
+    t0 = time.time()
+    r.acquire("digikey"); r.acquire("digikey")
+    assert time.time() - t0 < 0.05
+
+
+def test_a_known_greedy_source_is_paced():
+    """element14 answers 403 'Account Over Queries Per Second Limit' at about
+    three requests a second, which in a log looks exactly like a bad key."""
+    r = RateLimiter()
+    assert r.interval("element14") > 0
+    t0 = time.time()
+    r.acquire("element14"); r.acquire("element14")
+    assert time.time() - t0 >= r.interval("element14") * 0.9
+
+
+def test_rejection_backs_off_and_compounds():
+    r = RateLimiter()
+    first = r.penalise("digikey")
+    second = r.penalise("digikey")
+    assert second > first
+
+
+def test_backoff_is_capped():
+    r = RateLimiter()
+    for _ in range(20):
+        r.penalise("digikey")
+    assert r.interval("digikey") <= RateLimiter.MAX_INTERVAL
+
+
+def test_a_plain_403_is_not_treated_as_a_rate_limit():
+    """403 is also what an invalid key returns, and more waiting will not
+    cure that."""
+    class FakeHTTPError(Exception):
+        code = 403
+        def read(self):
+            return b'{"error":{"message":"Forbidden"}}'
+    assert RateLimiter.is_rejection(FakeHTTPError()) is False
+
+
+def test_a_429_is_always_a_rate_limit():
+    class FakeHTTPError(Exception):
+        code = 429
+    assert RateLimiter.is_rejection(FakeHTTPError()) is True
+
+
+def test_a_403_naming_the_rate_limit_is_one():
+    class FakeHTTPError(Exception):
+        code = 403
+        def read(self):
+            return b'{"error":{"message":"Account Over Queries Per Second Limit"}}'
+    assert RateLimiter.is_rejection(FakeHTTPError()) is True
+
+
+def test_learned_intervals_survive_a_reload():
+    c = _cache()
+    RateLimiter(c).penalise("mouser")
+    c.save()
+    assert RateLimiter(LifecycleCache(c.path)).interval("mouser") > 0
 
 
 # -- cache ----------------------------------------------------------------

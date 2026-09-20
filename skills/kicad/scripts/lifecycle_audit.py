@@ -272,6 +272,16 @@ def query_lifecycle_mouser(mpn: str, timeout: float = 10.0) -> dict | None:
     for part in data.get("SearchResults", {}).get("Parts", []):
         result = {}
         result["status"] = part.get("LifecycleStatus")
+        # On the tier this key reaches, LifecycleStatus and ProductStatus come
+        # back null on every part while Availability and pricing are populated.
+        # Saying so is better than letting a null masquerade as a silent
+        # source that might have agreed with DigiKey: the confidence model
+        # should know this source cannot vote, not think it abstained.
+        if not result["status"]:
+            result["provides_status"] = False
+            avail = part.get("Availability") or ""
+            if avail:
+                result["availability"] = avail
         result["discontinued"] = str(part.get("IsDiscontinued", "")).lower() == "true"
         result["lead_time"] = part.get("LeadTime")
         result["suggested_replacement"] = part.get("SuggestedReplacement")
@@ -305,18 +315,33 @@ def query_lifecycle_lcsc(mpn: str, timeout: float = 10.0) -> dict | None:
     except (urllib.error.URLError, OSError, json.JSONDecodeError):
         return None
 
+    # The upstream response used to nest a part under "extra" with its own
+    # mpn and attributes. It now returns the fields flat — description, mfr,
+    # lcsc, package, price, stock — so the old reader found no "extra", took
+    # comp_mpn as empty, skipped every component and returned None for every
+    # part on the board. It failed silently, which is the worst way for a
+    # source to fail: the audit reported a clean run with one fewer opinion in
+    # it and nothing said so.
+    needle = mpn.upper()[:6]
     for comp in data.get("components", []):
-        extra = comp.get("extra", {})
-        comp_mpn = extra.get("mpn", "")
-        if not comp_mpn or not comp_mpn.upper().startswith(mpn.upper()[:6]):
+        extra = comp.get("extra") or {}
+        haystack = " ".join(str(comp.get(k) or "") for k in
+                            ("mfr", "description", "lcsc")).upper()
+        comp_mpn = (extra.get("mpn") or comp.get("mfr") or "").upper()
+        if needle not in haystack and not comp_mpn.startswith(needle):
             continue
 
         result = {}
-        stock = comp.get("stock", 0)
+        stock = comp.get("stock", 0) or 0
         result["in_stock"] = stock > 0
         result["stock_qty"] = stock
+        # No lifecycle status is available from this source; it speaks to
+        # stock and temperature only. Saying so explicitly keeps it out of the
+        # confidence model's numerator rather than looking like a silent
+        # source that might have agreed.
+        result["provides_status"] = False
 
-        attrs = extra.get("attributes", {})
+        attrs = extra.get("attributes") or {}
         for k, v in attrs.items():
             if "operating temperature" in k.lower() and v:
                 temp = _parse_temp_range(v)
@@ -334,44 +359,73 @@ def query_lifecycle_lcsc(mpn: str, timeout: float = 10.0) -> dict | None:
 # element14 API
 # ---------------------------------------------------------------------------
 
-def query_lifecycle_element14(mpn: str, timeout: float = 10.0) -> dict | None:
-    """Query element14 for lifecycle and temperature data."""
+def query_lifecycle_element14(mpn: str, timeout: float = 10.0,
+                              store: str | None = None) -> dict | None:
+    """Query element14 for availability and temperature data.
+
+    Rebuilt against the documented request shape on 2026-09-20. The previous
+    version returned None for every part because it sent
+    ``storeInfo.id=us.newark.com``, which is not a store element14 recognises —
+    the identifiers are ``www.newark.com`` and ``uk.farnell.com`` — and omitted
+    ``callInfo.responseDataFormat``. The API answered 400 to all of it, the
+    caller swallowed the HTTPError as an ordinary URLError, and the audit
+    recorded a silent abstention rather than a broken request.
+
+    Note what this source does *not* return. ``productStatus`` holds values
+    like STOCKED and DIRECT_SHIP, which describe how element14 fulfils an
+    order rather than where the part sits in its life. Mapping those onto
+    active/obsolete would be inventing a lifecycle opinion, so the result is
+    marked as carrying no status and the confidence model leaves it out of the
+    count rather than treating it as a source that stayed quiet.
+    """
     api_key = os.environ.get("ELEMENT14_API_KEY")
     if not api_key:
         return None
 
+    store = store or os.environ.get("ELEMENT14_STORE") or "www.newark.com"
+    # Built by hand rather than with urlencode: the documented samples put
+    # callInfo.apiKey last and include an empty refinements.filters, and this
+    # is the shape that answers 200.
+    qs = (
+        "term=manuPartNum%%3A%s"
+        "&storeInfo.id=%s"
+        "&resultsSettings.offset=0"
+        "&resultsSettings.numberOfResults=2"
+        "&resultsSettings.refinements.filters="
+        "&resultsSettings.responseGroup=inventory"
+        "&callInfo.responseDataFormat=JSON"
+        "&callInfo.apiKey=%s"
+    ) % (urllib.parse.quote(mpn), store, urllib.parse.quote(api_key))
+
     try:
-        params = urllib.parse.urlencode({
-            "callInfo.apiKey": api_key,
-            "term": f"manuPartNum:{mpn}",
-            "storeInfo.id": "us.newark.com",
-            "resultsSettings.offset": 0,
-            "resultsSettings.numberOfResults": 3,
-            "resultsSettings.responseGroup": "medium",
-        })
-        url = f"https://api.element14.com/catalog/products?{params}"
-        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        req = urllib.request.Request("https://api.element14.com/catalog/products?" + qs,
+                                     headers={"Accept": "application/json"})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read())
     except (urllib.error.URLError, OSError, json.JSONDecodeError):
         return None
 
-    products = data.get("manufacturerPartNumberSearchReturn", {}).get("products", [])
+    products = (data.get("manufacturerPartNumberSearchReturn", {})
+                    .get("products") or [])
     for product in products:
-        result = {}
-        for attr in product.get("attributes", []):
-            label = attr.get("attributeLabel", "").lower()
+        result: dict = {"provides_status": False}
+        fulfilment = product.get("productStatus")
+        if fulfilment:
+            result["fulfilment"] = fulfilment
+        if product.get("sku"):
+            result["sku"] = product["sku"]
+        if product.get("isAwaitingRelease") is not None:
+            result["awaiting_release"] = bool(product["isAwaitingRelease"])
+        for attr in product.get("attributes") or []:
+            label = (attr.get("attributeLabel") or "").lower()
             value = attr.get("attributeValue", "")
-            if "lifecycle" in label or "status" in label:
-                result["status"] = value
-            elif "operating temperature" in label and value:
+            if "operating temperature" in label and value:
                 temp = _parse_temp_range(value)
                 if temp:
                     result["temp_min_c"] = temp[0]
                     result["temp_max_c"] = temp[1]
                     result["temp_raw"] = value
-        if result:
-            return result
+        return result
     return None
 
 
@@ -440,6 +494,7 @@ try:  # the cache module sits beside this one; keep working if it is absent
         LifecycleCache as _LifecycleCache,
         SourceScheduler as _SourceScheduler,
         score as _score,
+        RateLimiter as _RateLimiter,
         DEFAULT_TTL_DAYS as _DEFAULT_TTL_DAYS,
     )
 except ImportError:  # pragma: no cover
@@ -448,12 +503,14 @@ except ImportError:  # pragma: no cover
             LifecycleCache as _LifecycleCache,
             SourceScheduler as _SourceScheduler,
             score as _score,
+            RateLimiter as _RateLimiter,
             DEFAULT_TTL_DAYS as _DEFAULT_TTL_DAYS,
         )
     except Exception:
         _LifecycleCache = None  # type: ignore
         _SourceScheduler = None  # type: ignore
         _score = None  # type: ignore
+        _RateLimiter = None  # type: ignore
         _DEFAULT_TTL_DAYS = 45
 
 
@@ -478,7 +535,8 @@ _API_FNS = {
 }
 
 
-def _timed_query(fn, mpn: str, timeout: float):
+def _timed_query(fn, mpn: str, timeout: float, source: str = "",
+                 limiter=None):
     """Run one distributor query, reporting how long it took and whether it worked.
 
     The distinction matters to the scheduler: a source that answers "no such
@@ -486,19 +544,30 @@ def _timed_query(fn, mpn: str, timeout: float):
     one that raises after its full deadline should be pushed back and given a
     longer rope next time. Both return no data, so elapsed time is the only
     thing that separates them.
+
+    A third outcome is neither: the source refusing us because we asked too
+    fast. That must not be recorded as slowness, because the cure is waiting
+    longer between calls rather than waiting longer for an answer.
     """
+    if limiter is not None and source:
+        limiter.acquire(source)
     started = time.time()
     try:
         data = fn(mpn, timeout=timeout)
         return data, time.time() - started, True
-    except (urllib.error.URLError, OSError, json.JSONDecodeError,
-            KeyError, ValueError, TypeError):
-        return None, time.time() - started, False
+    except Exception as exc:
+        if limiter is not None and source and limiter.is_rejection(exc):
+            limiter.penalise(source)
+            return None, time.time() - started, True
+        if isinstance(exc, (urllib.error.URLError, OSError, json.JSONDecodeError,
+                            KeyError, ValueError, TypeError)):
+            return None, time.time() - started, False
+        raise
 
 
 def audit_component(mpn: str, sources: list[str], project_dir: str | None = None,
                     delay: float = 1.0, cache=None, scheduler=None,
-                    confidence_exit: float = 0.90) -> dict:
+                    confidence_exit: float = 0.90, limiter=None) -> dict:
     """Query the available sources for one component's lifecycle + temperature.
 
     Cache first, then whatever is left, concurrently. ``delay`` is retained for
@@ -564,7 +633,8 @@ def audit_component(mpn: str, sources: list[str], project_dir: str | None = None
             futures = {}
             for source_name in ordered:
                 fn = _API_FNS[source_name]
-                futures[pool.submit(_timed_query, fn, mpn, budgets[source_name])] = source_name
+                futures[pool.submit(_timed_query, fn, mpn, budgets[source_name],
+                                    source_name, limiter)] = source_name
             for fut in _as_completed(futures):
                 source_name = futures[fut]
                 try:
@@ -769,6 +839,7 @@ def audit_bom(analysis_json: dict, project_dir: str | None = None,
         cache = _LifecycleCache(path, ttl_days if ttl_days is not None else _DEFAULT_TTL_DAYS)
         scheduler = _SourceScheduler(cache, [s for s in _API_FNS
                                              if not sources or s in sources])
+    limiter = _RateLimiter(cache) if _RateLimiter is not None else None
 
     ordered_mpns = sorted(mpn_map.items())
     settled = 0
@@ -787,7 +858,8 @@ def audit_bom(analysis_json: dict, project_dir: str | None = None,
         mpn, refs = item
         return mpn, audit_component(mpn, sources or [], project_dir, delay,
                                     cache=cache, scheduler=scheduler,
-                                    confidence_exit=confidence_exit)
+                                    confidence_exit=confidence_exit,
+                                    limiter=limiter)
 
     with _ThreadPool(max_workers=max(1, concurrency)) as pool:
         for done, (mpn, data) in enumerate(pool.map(_one, ordered_mpns), start=1):
