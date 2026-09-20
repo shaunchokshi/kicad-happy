@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+"""Cache, source ranking and confidence scoring for the lifecycle audit.
+
+The audit used to be serial with a one-second sleep before every distributor
+call. At four sources and 57 distinct MPNs that is 228 seconds of sleep before
+a single packet moves, which is how a 600-second stage-8 budget came to be
+exceeded by a board that had merely grown from 91 parts to 109.
+
+Three things live here, and they are separate from the query functions on
+purpose: this module makes no network calls and so can be tested without one.
+
+  LifecycleCache   Distributor answers, keyed by (mpn, source), with a long
+                   TTL. Lifecycle status moves on a scale of quarters, not
+                   minutes, so re-running the pipeline during a design session
+                   should cost nothing at all.
+
+  score            How much to believe the answer. Four sources agreeing is
+                   the ideal; the interesting cases are the mixtures.
+
+  SourceScheduler  Which source to ask first and how long to wait, learned
+                   from what each one actually did last time.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+import time
+from typing import Any, Iterable
+
+__all__ = [
+    "LifecycleCache",
+    "SourceScheduler",
+    "score",
+    "STATUS_AXIS",
+    "DEFAULT_TTL_DAYS",
+]
+
+# A month was the ask; a quarter is closer to how fast this data actually
+# moves, so the default sits between and the CLI can widen it.
+DEFAULT_TTL_DAYS = 45
+
+# Lifecycle placed on one axis, so "how much do these sources disagree" has a
+# magnitude rather than only a yes or no. active-vs-nrnd is a quibble;
+# active-vs-obsolete means one of them is wrong about whether you can buy it.
+STATUS_AXIS: dict[str, int] = {
+    "active": 0,
+    "nrnd": 1,
+    "last_time_buy": 2,
+    "discontinued": 3,
+    "obsolete": 4,
+}
+
+# Confidence available from n sources that agree completely. Two agreeing
+# distributors clear the 0.80 bar that lets a part be reported as settled;
+# one source on its own never does, however emphatic it is.
+_BASE_BY_COUNT: dict[int, float] = {0: 0.0, 1: 0.55, 2: 0.82, 3: 0.93, 4: 1.0}
+
+# Weight on disagreement. At 0.5 a maximal split — active against obsolete —
+# halves the confidence rather than erasing it, because "two distributors
+# disagree" is itself a finding worth surfacing, not an absence of data.
+_SPREAD_WEIGHT = 0.5
+
+
+def score(per_source_status: dict[str, str]) -> dict[str, Any]:
+    """Confidence in a part's lifecycle status, and why.
+
+    Returns the agreed status where there is one, a confidence in [0, 1], and
+    the components that produced it, so a reviewer can see whether a low score
+    means "nobody answered" or "they answered and disagreed" — which look
+    identical in a single number and call for opposite responses.
+    """
+    known = {s: st for s, st in (per_source_status or {}).items()
+             if st in STATUS_AXIS}
+    n = len(known)
+    if n == 0:
+        return {
+            "confidence": 0.0,
+            "status": "unknown",
+            "responding": 0,
+            "agreement": None,
+            "spread": None,
+            "reason": "no source returned a usable status",
+        }
+
+    positions = [STATUS_AXIS[st] for st in known.values()]
+    lo, hi = min(positions), max(positions)
+    spread = (hi - lo) / (len(STATUS_AXIS) - 1)
+    base = _BASE_BY_COUNT.get(min(n, 4), 1.0)
+    confidence = base * (1.0 - _SPREAD_WEIGHT * spread)
+
+    # The worst status anyone reports is the one that matters: a part one
+    # distributor calls obsolete is a procurement problem even while another
+    # still lists it.
+    worst = max(known.values(), key=lambda st: STATUS_AXIS[st])
+    return {
+        "confidence": round(confidence, 3),
+        "status": worst,
+        "responding": n,
+        "agreement": round(1.0 - spread, 3),
+        "spread": round(spread, 3),
+        "reason": (
+            "%d source%s agreed" % (n, "" if n == 1 else "s") if spread == 0
+            else "%d sources, worst disagreement %d step%s on the lifecycle axis"
+                 % (n, hi - lo, "" if hi - lo == 1 else "s")
+        ),
+    }
+
+
+class LifecycleCache:
+    """Distributor answers and per-source timing, persisted between runs.
+
+    Read once at the start of a run and written once at the end, rather than
+    locked and updated per entry: the workers are threads sharing one process,
+    and a cache that needs a lock is a cache that can deadlock a build.
+    """
+
+    def __init__(self, path: str, ttl_days: float = DEFAULT_TTL_DAYS) -> None:
+        self.path = path
+        self.ttl = ttl_days * 86400.0
+        self._entries: dict[str, dict] = {}
+        self._timing: dict[str, dict] = {}
+        self.hits = 0
+        self.misses = 0
+        self.stale = 0
+        self._load()
+
+    # -- persistence -------------------------------------------------------
+
+    def _load(self) -> None:
+        try:
+            with open(self.path) as fh:
+                blob = json.load(fh)
+        except (OSError, ValueError):
+            return
+        if not isinstance(blob, dict):
+            return
+        self._entries = blob.get("entries") or {}
+        self._timing = blob.get("timing") or {}
+
+    def save(self) -> None:
+        blob = {
+            "schema": 1,
+            "saved_at": time.time(),
+            "entries": self._entries,
+            "timing": self._timing,
+        }
+        os.makedirs(os.path.dirname(os.path.abspath(self.path)) or ".", exist_ok=True)
+        # Write beside the target and rename, so an interrupted run cannot
+        # leave a half-written cache that the next one fails to parse.
+        fd, tmp = tempfile.mkstemp(
+            dir=os.path.dirname(os.path.abspath(self.path)) or ".", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as fh:
+                json.dump(blob, fh, indent=1, sort_keys=True)
+            os.replace(tmp, self.path)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    # -- answers -----------------------------------------------------------
+
+    @staticmethod
+    def _key(mpn: str, source: str) -> str:
+        return "%s\x1f%s" % (mpn.strip().upper(), source)
+
+    def get(self, mpn: str, source: str) -> dict | None:
+        row = self._entries.get(self._key(mpn, source))
+        if row is None:
+            self.misses += 1
+            return None
+        age = time.time() - row.get("fetched_at", 0)
+        if age > self.ttl:
+            self.stale += 1
+            return None
+        self.hits += 1
+        return row.get("data")
+
+    def put(self, mpn: str, source: str, data: dict | None) -> None:
+        # A negative answer is cached too. A source that does not carry a part
+        # will still not carry it tomorrow, and re-asking is the expensive
+        # half of this audit.
+        self._entries[self._key(mpn, source)] = {
+            "fetched_at": time.time(),
+            "data": data,
+        }
+
+    def covered(self, mpn: str, sources: Iterable[str],
+                count: bool = True) -> dict[str, dict | None]:
+        """Every fresh cached answer for one part.
+
+        Counts hits by default so the run summary reflects what the cache
+        actually saved. Callers that are only *probing* coverage — sizing a
+        runtime estimate, say — pass count=False, since asking whether an
+        answer exists is not the same as using it and inflating the hit rate
+        would make the cache look better than it is.
+        """
+        out: dict[str, dict | None] = {}
+        for src in sources:
+            row = self._entries.get(self._key(mpn, src))
+            if row is None:
+                if count:
+                    self.misses += 1
+                continue
+            if time.time() - row.get("fetched_at", 0) > self.ttl:
+                if count:
+                    self.stale += 1
+                continue
+            if count:
+                self.hits += 1
+            out[src] = row.get("data")
+        return out
+
+    # -- timing ------------------------------------------------------------
+
+    def observe(self, source: str, seconds: float, ok: bool) -> None:
+        row = self._timing.setdefault(
+            source, {"ewma_s": None, "ok": 0, "timeouts": 0})
+        if ok:
+            row["ok"] += 1
+            prev = row.get("ewma_s")
+            # Recent behaviour matters more than history: a distributor that
+            # slowed down this week should be reranked this week.
+            row["ewma_s"] = seconds if prev is None else 0.7 * prev + 0.3 * seconds
+        else:
+            row["timeouts"] += 1
+
+    def timing(self, source: str) -> dict:
+        return dict(self._timing.get(source) or {"ewma_s": None, "ok": 0, "timeouts": 0})
+
+    @property
+    def stats(self) -> dict:
+        return {"hits": self.hits, "misses": self.misses, "stale": self.stale,
+                "entries": len(self._entries)}
+
+
+# Timeout ladder. A source is asked with a small budget first and earns more
+# only by needing it, so one unresponsive distributor costs two seconds per
+# part on the first run rather than ten.
+LADDER: tuple[float, ...] = (2.0, 4.0, 6.0, 8.0, 10.0)
+
+
+class SourceScheduler:
+    """Which source to ask first, and how long to give it.
+
+    Ranking matters less than it would for serial queries, since the sources
+    are asked concurrently. It earns its place in two other ways: the fastest
+    sources are the ones an early exit gets to keep, and knowing each source's
+    typical latency is what makes a runtime estimate possible at all — which
+    is what lets stage 8 size its own timeout instead of guessing.
+    """
+
+    def __init__(self, cache: LifecycleCache, sources: list[str]) -> None:
+        self.cache = cache
+        self.sources = list(sources)
+
+    def budget(self, source: str) -> float:
+        """Seconds to allow this source, from how it behaved before."""
+        t = self.cache.timing(source)
+        ewma, timeouts, ok = t.get("ewma_s"), t.get("timeouts", 0), t.get("ok", 0)
+        if ewma is None:
+            # Never seen it answer. Start at the bottom of the ladder; a source
+            # that genuinely needs longer will climb on its own.
+            return LADDER[0] if timeouts == 0 else LADDER[min(timeouts, len(LADDER) - 1)]
+        # Two and a half times the running mean, rounded up the ladder, so a
+        # source sits one comfortable step above its own typical answer.
+        want = ewma * 2.5
+        for rung in LADDER:
+            if want <= rung:
+                return rung
+        return LADDER[-1]
+
+    def order(self) -> list[str]:
+        """Sources fastest-first; unproven ones ahead of known-slow ones."""
+        def sort_key(src: str) -> tuple[float, str]:
+            t = self.cache.timing(src)
+            ewma = t.get("ewma_s")
+            if ewma is None:
+                # Unproven sits mid-ladder: worth trying before a source known
+                # to be slow, not before one known to be fast.
+                return (LADDER[1], src)
+            penalty = 1.0 + min(t.get("timeouts", 0), 5) * 0.5
+            return (ewma * penalty, src)
+        return sorted(self.sources, key=sort_key)
+
+    def estimate(self, n_parts: int, concurrency: int,
+                 cached_parts: int = 0) -> dict:
+        """Roughly how long a run will take, for sizing the caller's timeout.
+
+        Deliberately an estimate of the *work*, not a promise. The caller is
+        expected to double it before using it as a deadline, because the thing
+        this protects against is the anomaly, not the average.
+        """
+        todo = max(0, n_parts - cached_parts)
+        if todo == 0:
+            return {"seconds": 0.0, "parts_to_fetch": 0, "per_part_s": 0.0,
+                    "concurrency": concurrency, "basis": "everything cached"}
+        per_source = []
+        for src in self.sources:
+            t = self.cache.timing(src)
+            per_source.append(t.get("ewma_s") or self.budget(src))
+        # Sources run together for one part, so that part costs the slowest of
+        # them; parts run together too, so the wall clock divides by workers.
+        per_part = max(per_source) if per_source else LADDER[0]
+        seconds = per_part * todo / max(1, concurrency)
+        return {
+            "seconds": round(seconds, 1),
+            "parts_to_fetch": todo,
+            "per_part_s": round(per_part, 2),
+            "concurrency": concurrency,
+            "basis": "measured" if any(
+                self.cache.timing(s).get("ewma_s") for s in self.sources
+            ) else "ladder defaults, no timings recorded yet",
+        }
