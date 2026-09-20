@@ -23,7 +23,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "kicad" / "scripts"))
 
 from lifecycle_cache import compute, user_age_penalty  # noqa: E402
 from lifecycle_table import (  # noqa: E402
-    USER_COLUMNS, merge_rows, parse_date, read_table, user_row, write_table,
+    DEPARTED_TAG, USER_COLUMNS, is_departed, merge_rows, parse_date,
+    read_table, user_row, write_table,
 )
 
 NOW = time.time()
@@ -217,3 +218,21 @@ if __name__ == "__main__":
             print("ok   %s" % name)
     print("\n%d failed" % failures if failures else "\nall passed")
     sys.exit(1 if failures else 0)
+
+
+def test_a_stale_ack_flag_clears_when_the_part_leaves_the_bom():
+    """A part off the board never asks anyone for an acknowledgement."""
+    existing = {"OLD-PART": {"MPN": "OLD-PART", "Ack?": "YES",
+                             "Reference": "https://example.invalid/old",
+                             "Notes": ""}}
+    row = {r["MPN"]: r for r in merge_rows(existing, {})}["OLD-PART"]
+    assert row["Ack?"] == ""
+    assert DEPARTED_TAG in row["Notes"]
+    # The research survives; only the demand on someone's time goes away.
+    assert row["Reference"] == "https://example.invalid/old"
+
+
+def test_is_departed_reads_the_tag():
+    assert is_departed({"Notes": "(%s)" % DEPARTED_TAG}) is True
+    assert is_departed({"Notes": "swapped for the 0402"}) is False
+    assert is_departed({}) is False

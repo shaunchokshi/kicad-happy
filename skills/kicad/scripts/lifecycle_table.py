@@ -21,8 +21,18 @@ import re
 import time
 from datetime import datetime, timezone
 
-__all__ = ["SCRIPT_COLUMNS", "USER_COLUMNS", "read_table", "merge_rows",
-           "render_table", "write_table", "parse_date"]
+__all__ = ["SCRIPT_COLUMNS", "USER_COLUMNS", "DEPARTED_TAG", "is_departed",
+           "read_table", "merge_rows", "render_table", "write_table",
+           "parse_date"]
+
+# A part that has left the BOM. Its row survives because someone's research is
+# in it, but it is history, not work: nothing about a part that is not on the
+# board can require a human decision.
+DEPARTED_TAG = "no longer in the BOM"
+
+
+def is_departed(row: dict[str, str]) -> bool:
+    return DEPARTED_TAG in (row.get("Notes") or "")
 
 # Rewritten from the audit on every run. "Ack?" sits directly beside the score
 # it follows from, because a two-digit number in a monospace edit view does not
@@ -143,9 +153,12 @@ def merge_rows(existing: dict[str, dict[str, str]],
         row = dict(prior)
         row["MPN"] = mpn
         note = row.get("Notes", "")
-        tag = "no longer in the BOM"
-        if tag not in note:
-            row["Notes"] = (note + " " if note else "") + "(%s)" % tag
+        if DEPARTED_TAG not in note:
+            row["Notes"] = (note + " " if note else "") + "(%s)" % DEPARTED_TAG
+        # The flag is a work list, and this is not work. Whatever the last run
+        # that still saw this part decided, nobody has to go and establish the
+        # lifecycle of something that is no longer on the board.
+        row["Ack?"] = ""
         out.append(row)
     return out
 
