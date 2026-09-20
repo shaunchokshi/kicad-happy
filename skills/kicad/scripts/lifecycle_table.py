@@ -24,8 +24,11 @@ from datetime import datetime, timezone
 __all__ = ["SCRIPT_COLUMNS", "USER_COLUMNS", "read_table", "merge_rows",
            "render_table", "write_table", "parse_date"]
 
-# Rewritten from the audit on every run.
-SCRIPT_COLUMNS = ["MPN", "Refs", "Status", "Computed", "Raw", "Sources"]
+# Rewritten from the audit on every run. "Ack?" sits directly beside the score
+# it follows from, because a two-digit number in a monospace edit view does not
+# announce itself — 57 and 85 look alike at a glance, and the difference
+# between them is whether somebody has to do something.
+SCRIPT_COLUMNS = ["MPN", "Refs", "Status", "Computed", "Ack?", "Raw", "Sources"]
 
 # Never written by the script once a human has put something there.
 USER_COLUMNS = ["User Status", "Checked On", "Reference", "Acknowledged", "Notes"]
@@ -43,6 +46,10 @@ _HEADER_NOTE = """<!-- Script columns (MPN, Refs, Status, Computed, Raw, Sources
      User Status accepts: active, nrnd, last_time_buy, discontinued, obsolete.
      Reference is required for a User Status to count at all - someone else has
      to be able to repeat the check.
+     Ack? is the script's flag, and it clears itself: it reads YES while a part
+     still needs a human decision and goes blank the moment the Acknowledged
+     column has something in it. Filter or sort on this column to find the work.
+
      Acknowledged: put your name and the date when you have accepted a part
      whose lifecycle could not be established. Nothing here blocks fabrication;
      unresolved parts need this acknowledgement instead. -->"""
@@ -118,6 +125,12 @@ def merge_rows(existing: dict[str, dict[str, str]],
         row["Status"] = f.get("status", "unknown")
         computed = f.get("computed")
         row["Computed"] = "" if computed is None else "%.0f" % computed
+        # Outstanding, not merely warranted: once a person has signed the
+        # Acknowledged column the flag clears, so what is left in this column
+        # is exactly the work still to do.
+        row["Ack?"] = ("YES" if (f.get("needs_ack")
+                                 and not (prior.get("Acknowledged") or "").strip())
+                       else "")
         raw = f.get("raw")
         row["Raw"] = "" if raw is None else "%.2f" % raw
         row["Sources"] = "%d/%d" % (f.get("responding", 0), f.get("capable", 0))

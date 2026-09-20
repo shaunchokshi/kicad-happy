@@ -174,6 +174,24 @@ def test_acknowledgement_clears_the_outstanding_list():
     assert write_table(p, FINDINGS)["awaiting_acknowledgement"] == []
 
 
+def test_the_ack_flag_says_yes_only_while_it_is_outstanding():
+    """A two-digit score in a monospace edit view does not announce itself —
+    57 and 85 look alike at a glance, and the difference between them is
+    whether somebody has to do something. The flag says so in words, and
+    clears itself once they have."""
+    p = _tbl()
+    write_table(p, FINDINGS)
+    rows = read_table(p)
+    assert rows["MM8108-MF15457"]["Ack?"] == "YES"   # needs_ack, unsigned
+    assert rows["STM32U5G9NJH6Q"]["Ack?"] == ""      # settled
+
+    rows["MM8108-MF15457"]["Acknowledged"] = "sc 2026-09-20"
+    from lifecycle_table import render_table
+    open(p, "w").write(render_table(merge_rows(rows, {})))
+    write_table(p, FINDINGS)
+    assert read_table(p)["MM8108-MF15457"]["Ack?"] == ""
+
+
 def test_dates_parse_and_missing_ones_do_not_raise():
     assert parse_date("2026-09-20") is not None
     assert parse_date("") is None
