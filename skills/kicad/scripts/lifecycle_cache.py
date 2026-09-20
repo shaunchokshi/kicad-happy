@@ -412,3 +412,124 @@ class RateLimiter:
             return False
         return any(t in body for t in
                    ("per second", "rate limit", "too many", "quota", "throttl"))
+
+
+# ---------------------------------------------------------------------------
+# Computed confidence
+# ---------------------------------------------------------------------------
+
+# The raw score answers "how much do the sources agree", and its ceiling is
+# set by how many sources exist. That is honest but unhelpful on its own: a
+# board where only one distributor publishes lifecycle at all can never exceed
+# 0.55 raw, which reads as a failing grade for a part that is in fact as
+# well-established as the available data allows.
+#
+# The computed score rescales the raw one against what was *achievable*. One
+# capable source in full agreement is 80 of 100 - good, and explicitly not
+# perfect, because a single opinion is a single opinion. Each further API
+# source raises the ceiling by 5, and a human who went and looked raises it by
+# 10, since a person reading a manufacturer's product page is better evidence
+# than an API that does not carry the field at all.
+_COMPUTED_BASE = 80.0
+_PER_EXTRA_API = 5.0
+_USER_BONUS = 10.0
+
+# Hand-entered data goes stale. It is not wrong on a schedule, but the older
+# it is the less it should carry, and past a year it should prompt someone to
+# look again rather than quietly holding a board's score up.
+_STALE_6MO_PENALTY = 5.0
+_STALE_1YR_PENALTY = 10.0
+_SIX_MONTHS = 182.5 * 86400
+_ONE_YEAR = 365.0 * 86400
+
+_RAW_CEILING_BY_COUNT = {1: 0.55, 2: 0.82, 3: 0.93, 4: 1.0}
+
+
+def user_age_penalty(checked_at: float | None, now: float | None = None) -> tuple[float, str]:
+    """How much to discount hand-entered data for age, and why."""
+    if not checked_at:
+        return _STALE_1YR_PENALTY, "no checked-on date"
+    age = (now or time.time()) - checked_at
+    if age > _ONE_YEAR:
+        return _STALE_1YR_PENALTY, "checked over a year ago"
+    if age > _SIX_MONTHS:
+        return _STALE_6MO_PENALTY, "checked over six months ago"
+    return 0.0, "checked within six months"
+
+
+def compute(per_source_status: dict[str, str], api_capable: int,
+            user: dict | None = None, now: float | None = None) -> dict:
+    """Rescale agreement onto 0-100, and say what a human must do.
+
+    Takes the raw per-source statuses rather than a finished raw score, because
+    a hand-entered opinion has to be folded in *before* the agreement is
+    measured. Scoring the APIs alone and then widening the divisor to admit the
+    user made a corroborating entry lower the result than no entry at all,
+    which is precisely backwards.
+
+    ``user`` is a row a person filled in: ``{"status": ..., "checked_at":
+    epoch, "reference": url}``. It counts as a capable source and is worth
+    more than an API, but it is flagged rather than trusted silently — on a
+    multi-user project someone else has to be able to repeat the check, which
+    is why a reference is required for it to count at all.
+
+    Nothing here blocks fabrication. Missing data and stale data both land in
+    the same place: a part a human has to acknowledge before the board goes
+    out, which is a decision someone makes on the record rather than a gate
+    that a script decides it has the standing to close.
+    """
+    reasons: list[str] = []
+    user_counts = bool(user and user.get("status") and user.get("reference"))
+    if user and user.get("status") and not user.get("reference"):
+        reasons.append("user-provided status ignored: no reference given, so "
+                       "nobody else can repeat the check")
+
+    combined = dict(per_source_status or {})
+    if user_counts:
+        combined["user"] = user["status"]
+
+    raw = score(combined, capable=max(1, api_capable) + (1 if user_counts else 0))
+    raw_conf = float(raw.get("confidence") or 0.0)
+    responding = int(raw.get("responding") or 0)
+
+    capable = max(1, api_capable) + (1 if user_counts else 0)
+    ceiling = (_COMPUTED_BASE + _PER_EXTRA_API * max(0, api_capable - 1)
+               + (_USER_BONUS if user_counts else 0.0))
+
+    if responding == 0:
+        return {
+            "computed": 0.0, "ceiling": round(ceiling, 1), "raw": raw_conf,
+            "status": "unknown", "capable": capable, "responding": 0,
+            "user_counted": user_counts, "needs_ack": True, "blocks_fab": False,
+            "reasons": reasons + ["no source could supply a lifecycle status"],
+        }
+
+    raw_ceiling = _RAW_CEILING_BY_COUNT.get(min(responding, 4), 1.0)
+    computed = (min(raw_conf, raw_ceiling) / raw_ceiling) * ceiling
+
+    penalty = 0.0
+    if user_counts:
+        penalty, why = user_age_penalty(user.get("checked_at"), now)
+        if penalty:
+            reasons.append("user data discounted %.0f: %s" % (penalty, why))
+    computed = max(0.0, computed - penalty)
+
+    disagreement = (raw.get("spread") or 0) > 0
+    if disagreement:
+        reasons.append("sources disagree — %s" % raw.get("reason", ""))
+
+    needs_ack = bool(penalty) or disagreement or computed < _COMPUTED_BASE
+    return {
+        "computed": round(computed, 1),
+        "ceiling": round(ceiling, 1),
+        "raw": raw_conf,
+        "status": raw.get("status", "unknown"),
+        "capable": capable,
+        "responding": responding,
+        "user_counted": user_counts,
+        "needs_ack": needs_ack,
+        # Lifecycle data that cannot be had is not a reason to stop a board.
+        # It is a reason for someone to say, in writing, that they know.
+        "blocks_fab": False,
+        "reasons": reasons,
+    }

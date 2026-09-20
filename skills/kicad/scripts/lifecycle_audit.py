@@ -89,6 +89,14 @@ _STATUS_NORMALIZE = {
     "new product": "active",
     "end of life": "obsolete",
     "factory special order": "active",
+    # Nexar / Octopart. Their value carries a freshness suffix - "Production
+    # (Last Updated: 2 weeks ago)" - which the normaliser strips before lookup.
+    "production": "active",
+    "new product": "active",
+    "not recommended for new designs": "nrnd",
+    "end of life": "obsolete",
+    "obsolete": "obsolete",
+    "last time buy": "last_time_buy",
     # Generic
     "nrnd": "nrnd",
     "eol": "obsolete",
@@ -97,10 +105,18 @@ _STATUS_NORMALIZE = {
 
 
 def _normalize_status(raw: str | None) -> str:
-    """Normalize a lifecycle status string to a standard value."""
+    """Normalize a lifecycle status string to a standard value.
+
+    Sources decorate the word. Nexar returns "Production (Last Updated: 2
+    weeks ago)", which carries useful provenance and no extra meaning, so the
+    parenthetical is dropped before the lookup rather than turning a perfectly
+    good status into "unknown".
+    """
     if not raw:
         return "unknown"
-    return _STATUS_NORMALIZE.get(raw.lower().strip(), "unknown")
+    text = raw.lower().strip()
+    text = re.sub(r"\s*\(.*?\)\s*$", "", text).strip()
+    return _STATUS_NORMALIZE.get(text, "unknown")
 
 
 # ---------------------------------------------------------------------------
@@ -430,6 +446,135 @@ def query_lifecycle_element14(mpn: str, timeout: float = 10.0,
 
 
 # ---------------------------------------------------------------------------
+# Nexar / Octopart
+# ---------------------------------------------------------------------------
+
+def _get_nexar_token() -> str | None:
+    """A Nexar bearer token from the client-credentials pair.
+
+    No redirect and no browser, so the callback URL the portal insists on at
+    app creation is never exercised by this flow. A static NEXAR_ACCESS_TOKEN
+    is honoured if that is all there is, but it expires in a day, so the
+    credentials are preferred and the minted token is cached like DigiKey's.
+    """
+    cid = os.environ.get("NEXAR_CLIENT_ID")
+    secret = os.environ.get("NEXAR_CLIENT_SECRET")
+    if not (cid and secret):
+        return os.environ.get("NEXAR_ACCESS_TOKEN") or None
+
+    cache_path = os.path.join(tempfile.gettempdir(), "nexar_token_cache.json")
+    try:
+        with open(cache_path) as fh:
+            cached = json.load(fh)
+        if cached.get("expires_at", 0) > time.time() + 60:
+            return cached["access_token"]
+    except (OSError, ValueError, KeyError):
+        pass
+
+    body = urllib.parse.urlencode({
+        "grant_type": "client_credentials",
+        "client_id": cid, "client_secret": secret,
+        "scope": "supply.domain",
+    }).encode()
+    try:
+        req = urllib.request.Request(
+            "https://identity.nexar.com/connect/token", data=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            tok = json.loads(resp.read())
+    except (urllib.error.URLError, OSError, json.JSONDecodeError, KeyError):
+        return None
+
+    try:
+        with open(cache_path, "w") as fh:
+            json.dump({"access_token": tok["access_token"],
+                       "expires_at": time.time() + int(tok.get("expires_in", 3600))}, fh)
+    except OSError:
+        pass
+    return tok.get("access_token")
+
+
+_NEXAR_QUERY = """
+query ($q: String!) {
+  supSearchMpn(q: $q, limit: 1) {
+    results {
+      part {
+        mpn
+        manufacturer { name }
+        totalAvail
+        estimatedFactoryLeadDays
+        specs { attribute { shortname } value displayValue }
+      }
+    }
+  }
+}"""
+
+
+def query_lifecycle_nexar(mpn: str, timeout: float = 10.0) -> dict | None:
+    """Query Nexar for lifecycle, availability and temperature.
+
+    Deliberately not in the default source set. An evaluation licence carries
+    a hard lifetime cap on part lookups — a hundred, on the one this was built
+    against — so a source that silently ran on every pipeline invocation would
+    spend the whole allowance during a single afternoon's design iteration.
+    It runs when asked for and not otherwise, and the cache means asking twice
+    for the same part costs one lookup.
+
+    Lifecycle arrives as a spec rather than a field: attribute shortname
+    ``lifecyclestatus``, with values like "Production (Last Updated: 2 weeks
+    ago)".
+    """
+    token = _get_nexar_token()
+    if not token:
+        return None
+    try:
+        req = urllib.request.Request(
+            "https://api.nexar.com/graphql",
+            data=json.dumps({"query": _NEXAR_QUERY, "variables": {"q": mpn}}).encode(),
+            headers={"Content-Type": "application/json",
+                     "Authorization": "Bearer " + token})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read())
+    except (urllib.error.URLError, OSError, json.JSONDecodeError):
+        return None
+    if data.get("errors"):
+        return None
+
+    results = (((data.get("data") or {}).get("supSearchMpn") or {})
+               .get("results") or [])
+    for entry in results:
+        part = entry.get("part") or {}
+        got = (part.get("mpn") or "").upper()
+        if got and not got.startswith(mpn.upper()[:6]):
+            continue
+        result: dict = {}
+        for spec in part.get("specs") or []:
+            short = ((spec.get("attribute") or {}).get("shortname") or "").lower()
+            value = spec.get("displayValue") or spec.get("value")
+            if short == "lifecyclestatus" and value:
+                result["status"] = value
+            elif "operating" in short and "temp" in short and value:
+                temp = _parse_temp_range(str(value))
+                if temp:
+                    result["temp_min_c"] = temp[0]
+                    result["temp_max_c"] = temp[1]
+                    result["temp_raw"] = value
+        avail = part.get("totalAvail")
+        if avail is not None:
+            result["in_stock"] = avail > 0
+            result["stock_qty"] = avail
+        lead = part.get("estimatedFactoryLeadDays")
+        if lead is not None:
+            result["lead_time_days"] = lead
+        if part.get("manufacturer"):
+            result["manufacturer"] = (part["manufacturer"] or {}).get("name")
+        if not result.get("status"):
+            result["provides_status"] = False
+        return result or None
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Datasheet extraction cache (local, no network)
 # ---------------------------------------------------------------------------
 
@@ -532,7 +677,18 @@ _API_FNS = {
     "digikey": query_lifecycle_digikey,
     "element14": query_lifecycle_element14,
     "mouser": query_lifecycle_mouser,
+    "nexar": query_lifecycle_nexar,
 }
+
+# Queried unless the caller narrows the set. Nexar is absent on purpose: the
+# evaluation licence it was built against allows a hundred part lookups for
+# the life of the key, and this pipeline gets run dozens of times a day.
+DEFAULT_SOURCES = ["lcsc", "digikey", "element14", "mouser"]
+
+# Which sources can actually return a lifecycle status, as opposed to stock or
+# fulfilment. The confidence ceiling is set from this, not from how many
+# distributors were contacted.
+STATUS_CAPABLE = {"digikey", "nexar"}
 
 
 def _timed_query(fn, mpn: str, timeout: float, source: str = "",
@@ -580,7 +736,8 @@ def audit_component(mpn: str, sources: list[str], project_dir: str | None = None
     per_source_status: dict[str, str] = {}
     temp_data = None
 
-    wanted = [s for s in _API_FNS if not sources or s in sources]
+    wanted = [s for s in _API_FNS
+              if (s in sources if sources else s in DEFAULT_SOURCES)]
 
     # Try extraction cache first (no network, no delay)
     if project_dir:
@@ -838,7 +995,8 @@ def audit_bom(analysis_json: dict, project_dir: str | None = None,
         path = cache_path or _default_cache_path(project_dir)
         cache = _LifecycleCache(path, ttl_days if ttl_days is not None else _DEFAULT_TTL_DAYS)
         scheduler = _SourceScheduler(cache, [s for s in _API_FNS
-                                             if not sources or s in sources])
+                                             if (s in sources if sources
+                                                 else s in DEFAULT_SOURCES)])
     limiter = _RateLimiter(cache) if _RateLimiter is not None else None
 
     ordered_mpns = sorted(mpn_map.items())
@@ -1191,6 +1349,11 @@ def main():
         help="Query only specific sources (comma-separated: digikey,mouser,lcsc,element14)",
     )
     parser.add_argument(
+        "--nexar", action="store_true",
+        help="Also query Nexar. OFF by default: an evaluation licence caps "
+             "part lookups for the life of the key, so this must be asked for",
+    )
+    parser.add_argument(
         "--cache", dest="cache_path", default=None,
         help="Lifecycle cache file (default: <project>/analysis/lifecycle_cache.json)",
     )
@@ -1267,7 +1430,10 @@ def main():
 
     # Run audit
     result = audit_bom(analysis, project_dir=project_dir, temp_range=temp_range,
-                       sources=sources, delay=args.delay,
+                       sources=(sources or (DEFAULT_SOURCES + ["nexar"]
+                                            if getattr(args, "nexar", False)
+                                            else DEFAULT_SOURCES)),
+                       delay=args.delay,
                        cache_path=(None if getattr(args, "no_cache", False) else args.cache_path),
                        ttl_days=(0.0 if getattr(args, "no_cache", False) else args.ttl_days),
                        concurrency=args.concurrency,
