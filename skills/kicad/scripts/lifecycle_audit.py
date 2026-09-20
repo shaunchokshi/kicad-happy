@@ -640,8 +640,10 @@ try:  # the cache module sits beside this one; keep working if it is absent
         SourceScheduler as _SourceScheduler,
         score as _score,
         RateLimiter as _RateLimiter,
+        compute as _compute,
         DEFAULT_TTL_DAYS as _DEFAULT_TTL_DAYS,
     )
+    import lifecycle_table as _table
 except ImportError:  # pragma: no cover
     try:
         from .lifecycle_cache import (  # type: ignore
@@ -649,14 +651,34 @@ except ImportError:  # pragma: no cover
             SourceScheduler as _SourceScheduler,
             score as _score,
             RateLimiter as _RateLimiter,
+            compute as _compute,
             DEFAULT_TTL_DAYS as _DEFAULT_TTL_DAYS,
         )
+        from . import lifecycle_table as _table  # type: ignore
     except Exception:
         _LifecycleCache = None  # type: ignore
         _SourceScheduler = None  # type: ignore
         _score = None  # type: ignore
         _RateLimiter = None  # type: ignore
+        _compute = None  # type: ignore
+        _table = None  # type: ignore
         _DEFAULT_TTL_DAYS = 45
+
+
+def _default_table_path(project_dir: str | None) -> str | None:
+    """Where the project's lifecycle table lives.
+
+    Beside the design documents rather than in the analysis directory: it is
+    something a person edits and reviews in a diff, not an artefact a run
+    produces and discards.
+    """
+    if not project_dir:
+        return None
+    root = os.path.abspath(project_dir)
+    # The schematic sits in .pipeline/; the design files are its parent.
+    if os.path.basename(root) == ".pipeline":
+        root = os.path.dirname(root)
+    return os.path.join(root, "lifecycle.md")
 
 
 def _default_cache_path(project_dir: str | None) -> str:
@@ -950,6 +972,7 @@ def audit_bom(analysis_json: dict, project_dir: str | None = None,
               concurrency: int = 8,
               confidence_exit: float = 0.90,
               report_threshold: float = 0.80,
+              table_path: str | None = None,
               progress=None) -> dict:
     """Audit all components in the BOM for lifecycle and temperature.
 
@@ -1030,6 +1053,42 @@ def audit_bom(analysis_json: dict, project_dir: str | None = None,
                           "fraction_settled": settled / total if total else 1.0,
                           "mpn": mpn, "confidence": conf})
             print("[%d/%d] %s  conf=%.2f" % (done, total, mpn, conf), file=sys.stderr)
+
+    # Fold in whatever a human already wrote into the project's table, score
+    # each part against what was actually achievable, and write the script
+    # columns back without touching theirs.
+    table_summary = None
+    if _table is not None and _compute is not None:
+        path = table_path or _default_table_path(project_dir)
+        existing = _table.read_table(path) if path else {}
+        api_capable = len([s for s in (scheduler.sources if scheduler else [])
+                           if s in STATUS_CAPABLE])
+        findings_for_table: dict[str, dict] = {}
+        for mpn, data in results.items():
+            user = _table.user_row(existing.get(mpn, {})) if existing else None
+            scored = _compute(data.get("per_source_status") or {},
+                              api_capable, user)
+            data["computed_confidence"] = scored
+            findings_for_table[mpn] = {
+                "refs": sorted(mpn_map.get(mpn, []))[:6],
+                "status": scored.get("status", data.get("status", "unknown")),
+                "computed": scored.get("computed"),
+                "raw": scored.get("raw"),
+                "responding": scored.get("responding"),
+                "capable": scored.get("capable"),
+                "needs_ack": scored.get("needs_ack"),
+            }
+        if path:
+            try:
+                table_summary = _table.write_table(path, findings_for_table)
+                print("lifecycle: table %s — %d rows, %d carrying human input, "
+                      "%d awaiting acknowledgement"
+                      % (path, table_summary["rows"],
+                         table_summary["with_user_data"],
+                         len(table_summary["awaiting_acknowledgement"])),
+                      file=sys.stderr)
+            except OSError as exc:
+                print("lifecycle: table not written (%s)" % exc, file=sys.stderr)
 
     if cache is not None:
         try:

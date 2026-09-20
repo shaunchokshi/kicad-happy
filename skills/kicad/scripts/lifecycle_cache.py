@@ -479,14 +479,23 @@ def compute(per_source_status: dict[str, str], api_capable: int,
     that a script decides it has the standing to close.
     """
     reasons: list[str] = []
-    user_counts = bool(user and user.get("status") and user.get("reference"))
-    if user and user.get("status") and not user.get("reference"):
+    user_status = ((user or {}).get("status") or "").strip().lower()
+    has_ref = bool((user or {}).get("reference"))
+    # A recorded "unknown" is a real and useful thing to write down - someone
+    # went to the vendor and there was nothing to find - but it is not an
+    # opinion, so it must not raise the ceiling as though a source had voted.
+    # Only a status that lands on the lifecycle axis counts.
+    user_counts = bool(user_status in STATUS_AXIS and has_ref)
+    if user_status and user_status not in STATUS_AXIS:
+        reasons.append("human checked and found no lifecycle information "
+                       "published (%s)" % (user.get("reference") or "no reference"))
+    elif user_status and not has_ref:
         reasons.append("user-provided status ignored: no reference given, so "
                        "nobody else can repeat the check")
 
     combined = dict(per_source_status or {})
     if user_counts:
-        combined["user"] = user["status"]
+        combined["user"] = user_status
 
     raw = score(combined, capable=max(1, api_capable) + (1 if user_counts else 0))
     raw_conf = float(raw.get("confidence") or 0.0)
@@ -504,7 +513,14 @@ def compute(per_source_status: dict[str, str], api_capable: int,
             "reasons": reasons + ["no source could supply a lifecycle status"],
         }
 
-    raw_ceiling = _RAW_CEILING_BY_COUNT.get(min(responding, 4), 1.0)
+    # Normalise against what was *achievable*, not against what answered.
+    # Dividing by the ceiling for the number that responded made any single
+    # agreeing source score full marks — one human check on a part reading 95
+    # of 95, the same as that human plus two distributors all agreeing. The
+    # ceiling is the maximum possible; reaching it has to require actually
+    # getting the corroboration, not merely being able to ask for it.
+    capable = max(capable, responding)
+    raw_ceiling = _RAW_CEILING_BY_COUNT.get(min(capable, 4), 1.0)
     computed = (min(raw_conf, raw_ceiling) / raw_ceiling) * ceiling
 
     penalty = 0.0

@@ -9401,6 +9401,19 @@ def main():
                         help="Root .kicad_sch for hierarchy context (auto-discovered if omitted)")
     parser.add_argument("--no-hierarchy", action="store_true",
                         help="Disable hierarchy auto-discovery (treat file as standalone root)")
+    parser.add_argument("--nexar", action="store_true",
+                        help="Include Nexar in the lifecycle audit. OFF by default: "
+                             "an evaluation licence caps part lookups for the life "
+                             "of the key, so this must be asked for")
+    parser.add_argument("--lifecycle-concurrency", type=int, default=8,
+                        help="Parts fetched at once during the lifecycle audit (default: 8)")
+    parser.add_argument("--lifecycle-ttl-days", type=float, default=None,
+                        help="How long a cached distributor answer stays fresh")
+    parser.add_argument("--no-lifecycle-cache", action="store_true",
+                        help="Ignore and do not write the lifecycle cache")
+    parser.add_argument("--lifecycle-table", default=None,
+                        help="Path to the project's lifecycle table "
+                             "(default: <project>/lifecycle.md)")
     parser.add_argument("--lifecycle", action="store_true",
                         help="Run lifecycle/obsolescence audit (requires network + API keys)")
     parser.add_argument("--analysis-dir", default=None,
@@ -9556,7 +9569,17 @@ def main():
         try:
             from lifecycle_audit import audit_bom
             project_dir = str(Path(args.schematic).parent)
-            lifecycle = audit_bom(result, project_dir=project_dir)
+            from lifecycle_audit import DEFAULT_SOURCES
+            _srcs = (DEFAULT_SOURCES + ["nexar"]
+                     if getattr(args, "nexar", False) else DEFAULT_SOURCES)
+            lifecycle = audit_bom(
+                result, project_dir=project_dir,
+                sources=_srcs,
+                concurrency=getattr(args, "lifecycle_concurrency", 8),
+                ttl_days=(0.0 if getattr(args, "no_lifecycle_cache", False)
+                          else getattr(args, "lifecycle_ttl_days", None)),
+                table_path=getattr(args, "lifecycle_table", None),
+            )
             if lifecycle and lifecycle.get("components_checked", 0) > 0:
                 result["lifecycle_audit"] = lifecycle
                 print(f"Lifecycle: {lifecycle.get('lifecycle_summary', {})}", file=sys.stderr)
