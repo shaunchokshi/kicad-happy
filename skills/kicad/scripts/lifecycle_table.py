@@ -22,6 +22,7 @@ import time
 from datetime import datetime, timezone
 
 __all__ = ["SCRIPT_COLUMNS", "USER_COLUMNS", "DEPARTED_TAG", "is_departed",
+           "cell",
            "read_table", "merge_rows", "render_table", "write_table",
            "parse_date"]
 
@@ -163,17 +164,30 @@ def merge_rows(existing: dict[str, dict[str, str]],
     return out
 
 
+def cell(value) -> str:
+    """One table cell's text, guaranteed not to end the cell or the row.
+
+    A pipe or a newline in a Notes field silently splits the row in two, and
+    the damage only shows up later as a parse error somewhere else. The
+    characters are worth less than the table, so they are replaced rather
+    than escaped: a reader seeing a slash knows what happened.
+    """
+    text = "" if value is None else str(value)
+    return text.replace("|", "/").replace("\r", " ").replace("\n", " ").strip()
+
+
 def render_table(rows: list[dict[str, str]], title: str = "Lifecycle") -> str:
-    widths = {c: max(len(c), *(len(str(r.get(c, ""))) for r in rows)) if rows
+    cells = [{c: cell(r.get(c, "")) for c in COLUMNS} for r in rows]
+    widths = {c: max(len(c), *(len(r[c]) for r in cells)) if cells
               else len(c) for c in COLUMNS}
-    def line(cells):
-        return "| " + " | ".join(str(cells[i]).ljust(widths[c])
+    def line(values):
+        return "| " + " | ".join(str(values[i]).ljust(widths[c])
                                  for i, c in enumerate(COLUMNS)) + " |"
     parts = ["# %s" % title, "", _HEADER_NOTE, "",
              line(COLUMNS),
              "|" + "|".join("-" * (widths[c] + 2) for c in COLUMNS) + "|"]
-    for r in rows:
-        parts.append(line([r.get(c, "") for c in COLUMNS]))
+    for r in cells:
+        parts.append(line([r[c] for c in COLUMNS]))
     parts.append("")
     return "\n".join(parts)
 

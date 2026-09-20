@@ -23,8 +23,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "kicad" / "scripts"))
 
 from lifecycle_cache import compute, user_age_penalty  # noqa: E402
 from lifecycle_table import (  # noqa: E402
-    DEPARTED_TAG, USER_COLUMNS, is_departed, merge_rows, parse_date,
-    read_table, user_row, write_table,
+    COLUMNS, DEPARTED_TAG, USER_COLUMNS, is_departed, merge_rows, parse_date,
+    read_table, render_table, user_row, write_table,
 )
 
 NOW = time.time()
@@ -236,3 +236,21 @@ def test_is_departed_reads_the_tag():
     assert is_departed({"Notes": "(%s)" % DEPARTED_TAG}) is True
     assert is_departed({"Notes": "swapped for the 0402"}) is False
     assert is_departed({}) is False
+
+
+def read_table_text(text: str) -> dict:
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "lifecycle.md")
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        return read_table(p)
+
+
+def test_a_pipe_or_newline_in_a_note_cannot_split_the_row():
+    """The failure this guards against corrupted the real table once already."""
+    rows = [{"MPN": "X1", "Notes": "line one\nline two | and a pipe"}]
+    text = render_table(rows)
+    body = [l for l in text.splitlines() if l.startswith("| X1")]
+    assert len(body) == 1
+    assert body[0].count("|") == len(COLUMNS) + 1
+    assert read_table_text(text)["X1"]["Notes"] == "line one line two / and a pipe"
