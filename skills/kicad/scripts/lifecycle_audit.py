@@ -1025,6 +1025,28 @@ def audit_bom(analysis_json: dict, project_dir: str | None = None,
     ordered_mpns = sorted(mpn_map.items())
     settled = 0
     results: dict[str, dict] = {}
+
+    # The computed score is what "80% confident" means to a reader: the raw
+    # agreement score is normalised against what was achievable, and where
+    # DigiKey is the only status-capable source it cannot exceed 0.55 however
+    # certain the answer is. Scoring against raw made `settled` structurally
+    # zero and the progress fraction with it, so the context the score needs
+    # is gathered here rather than after the loop.
+    table_path_resolved = table_path or _default_table_path(project_dir)
+    scoring = _table is not None and _compute is not None
+    existing_rows = (_table.read_table(table_path_resolved)
+                     if scoring and table_path_resolved else {})
+    api_capable = len([s for s in (scheduler.sources if scheduler else [])
+                       if s in STATUS_CAPABLE])
+
+    def _score(mpn, data):
+        """The 0-100 score for one part, or None when scoring is unavailable."""
+        if not scoring:
+            return None
+        user = _table.user_row(existing_rows.get(mpn, {})) if existing_rows else None
+        scored = _compute(data.get("per_source_status") or {}, api_capable, user)
+        data["computed_confidence"] = scored
+        return scored
     if cache is not None and scheduler is not None:
         cached_fully = sum(
             1 for mpn, _ in ordered_mpns
@@ -1045,30 +1067,29 @@ def audit_bom(analysis_json: dict, project_dir: str | None = None,
     with _ThreadPool(max_workers=max(1, concurrency)) as pool:
         for done, (mpn, data) in enumerate(pool.map(_one, ordered_mpns), start=1):
             results[mpn] = data
-            conf = (data.get("confidence") or {}).get("confidence", 0.0)
-            if conf >= report_threshold:
+            raw = (data.get("confidence") or {}).get("confidence", 0.0)
+            scored = _score(mpn, data)
+            # report_threshold is a fraction; the computed score is out of 100.
+            conf = scored["computed"] if scored else raw * 100.0
+            if conf >= report_threshold * 100.0:
                 settled += 1
             if progress is not None:
                 progress({"done": done, "total": total, "settled": settled,
                           "fraction_settled": settled / total if total else 1.0,
-                          "mpn": mpn, "confidence": conf})
-            print("[%d/%d] %s  conf=%.2f" % (done, total, mpn, conf), file=sys.stderr)
+                          "mpn": mpn, "confidence": conf, "raw": raw})
+            print("[%d/%d] %s  conf=%.0f (raw %.2f)" % (done, total, mpn, conf, raw),
+                  file=sys.stderr)
 
     # Fold in whatever a human already wrote into the project's table, score
     # each part against what was actually achievable, and write the script
     # columns back without touching theirs.
     table_summary = None
-    if _table is not None and _compute is not None:
-        path = table_path or _default_table_path(project_dir)
-        existing = _table.read_table(path) if path else {}
-        api_capable = len([s for s in (scheduler.sources if scheduler else [])
-                           if s in STATUS_CAPABLE])
+    if scoring:
+        path = table_path_resolved
         findings_for_table: dict[str, dict] = {}
         for mpn, data in results.items():
-            user = _table.user_row(existing.get(mpn, {})) if existing else None
-            scored = _compute(data.get("per_source_status") or {},
-                              api_capable, user)
-            data["computed_confidence"] = scored
+            # Already scored in the loop above; _score is idempotent.
+            scored = data.get("computed_confidence") or _score(mpn, data)
             findings_for_table[mpn] = {
                 "refs": sorted(mpn_map.get(mpn, []))[:6],
                 "status": scored.get("status", data.get("status", "unknown")),
